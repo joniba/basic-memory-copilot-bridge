@@ -9,9 +9,9 @@ const defaults = {
   enabled: true,
   minimumTranscriptBytes: 30000,
   minimumDeltaBytes: 20000,
-  minimumMinutesBetweenPrompts: 30,
+  minimumMinutesBetweenPrompts: 60,
   captureAfterPreCompact: true,
-  debugLogging: false,
+  debugLogging: true,
 };
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);

@@ -31,37 +31,46 @@ The bridge does not install, replace, or reconfigure your MCP server or skill.
 
 ## Install or try locally
 
-Run these commands from the directory containing `plugin.json`:
+Copilot CLI **1.0.93-2** rejects local paths in `plugin install`, including
+`.`. Its supported persistent-install syntax is a marketplace entry,
+GitHub repository, or Git URL. For this repository, run from any directory:
 
 ```powershell
 # Persistent installation for future Copilot sessions:
-copilot plugin install .
+copilot plugin install joniba/basic-memory-copilot-bridge
 copilot plugin list
 
 # Then start a new Copilot session.
 copilot
 ```
 
+This installs the published repository, whose default branch is `main`, not
+uncommitted files in a local checkout. No manually managed clone is needed;
+Copilot manages retrieval and its installation cache. This does not imply
+that the plugin manager never uses Git cloning internally.
+
 Installation caches a copy under Copilot's `installed-plugins` directory.
 It enables this plugin for future sessions, not just this repository. Existing
 sessions do not acquire these hooks until their configuration is reloaded;
 starting a new session is the simplest activation path.
 
-For selective use without a persistent installation:
+For selective use directly from the existing main checkout, without a
+persistent installation or another repository download:
 
 ```powershell
-copilot --plugin-dir 'C:\path\to\basic-memory-copilot-bridge'
+copilot --plugin-dir 'C:\code\dev\basic-memory-copilot-bridge'
 ```
 
-Do not install and mount the same plugin simultaneously. The development
-worktree for this POC is
-`C:\code\dev\basic-memory-copilot-bridge\worktrees\automatic-memory-capture`.
+Do not install and mount the same plugin simultaneously. `--plugin-dir`
+applies only to that invocation; it is not a persistent installation.
 
 The `--plugin-dir` path loads files directly. Edit its `config.json` to change
 the next hook invocation. A persistent install uses its **cached** `config.json`,
-not the source checkout: edit that installed copy, or edit the source and
-reinstall deliberately to replace the cached copy. Reinstallation can replace
-local edits to the installed copy.
+not the source checkout. Edit that installed copy for local configuration.
+To obtain published code changes, run
+`copilot plugin update basic-memory-copilot`, then start a new session.
+Updating or reinstalling can replace local edits to the installed copy;
+editing the source checkout alone does not update a persistent installation.
 
 To disable capture without uninstalling, set `"enabled": false` in the active
 plugin's `config.json`. A file containing only `{"enabled": false}` is valid.
@@ -91,9 +100,9 @@ the event name as an argument and the Copilot event JSON on stdin.
 | `enabled` | `true` | Master capture switch |
 | `minimumTranscriptBytes` | `30000` | Minimum total transcript file size |
 | `minimumDeltaBytes` | `20000` | Bytes since the previous opportunity, or initial baseline |
-| `minimumMinutesBetweenPrompts` | `30` | Cooldown after each offered checkpoint |
+| `minimumMinutesBetweenPrompts` | `60` | Cooldown after each offered checkpoint |
 | `captureAfterPreCompact` | `true` | Pending compaction bypasses normal thresholds |
-| `debugLogging` | `false` | Emit operational gate decisions to stderr |
+| `debugLogging` | `true` | Emit operational gate decisions to stderr |
 
 Missing configuration keys inherit defaults. Invalid configuration, including
 unknown keys, disables that invocation with a sanitized diagnostic. The first
@@ -139,6 +148,10 @@ opens the transcript, searches for other sessions, sends network requests,
 persists prompts, or logs content. Diagnostics contain only timestamp, event,
 session ID, byte count, and a fixed gate/error code. Error messages and stacks
 are deliberately excluded. Copilot may record stderr in its own logs.
+With Copilot's `--log-level debug`, look for `[rust:hooks] [hook stderr]`
+in that process's `%USERPROFILE%\.copilot\logs\process-*.log`; the bridge
+does not create a separate log file. Each record is a short JSON line
+emitted at a hook stop or pre-compaction event.
 
 The continuation runs through the session's existing Copilot model, so an
 offered checkpoint incurs normal model/tool usage. This is not offline
@@ -223,10 +236,13 @@ Do not use real sensitive work merely to fill a transcript.
 | Simulated preCompact | Flag/time recorded; next live stop bypassed 1 GB size/delta gates and a 60-minute cooldown, then cleared the flag |
 | Failure cases | Corrupt/missing/unreadable state, missing transcript, invalid input/config, and unwritable data directory fail open in automated tests |
 
-The live checks used an isolated Copilot profile and a separate test mount.
-Production defaults remain 30,000 bytes / 20,000 new bytes / 30 minutes.
-No global plugin activation, MCP configuration edits, dependency changes, or
-changes to the installed upstream skill were made.
+The live checks used an isolated Copilot profile and a separate `--plugin-dir`
+test mount. They did not verify persistent `plugin install`; the original
+local-path installation instructions were incorrect for this CLI version.
+These 2026-10-07 acceptance checks used the original defaults of 30,000 bytes /
+20,000 new bytes / 30 minutes. The current cooldown default is 60 minutes.
+The isolated test profile did not activate a global plugin or change MCP
+configuration, dependencies, or the installed upstream skill.
 
 An earlier test profile hit an MCP initialization error: the server reported
 protocol `2026-07-28` while Copilot requested `2025-11-25`. After the test harness
@@ -253,7 +269,10 @@ The installed CLI's help and shipped `HookType` schema were checked alongside
 the current official references, then plugin discovery and command execution
 were exercised in the installed runtime. The packaged README was absent;
 `copilot help hooks` and `copilot help plugins` are not valid help topics in
-this build. `copilot plugin --help` is valid.
+this build. `copilot plugin --help` is valid. Although the web documentation
+describes local-path installation, this installed version's
+`copilot plugin install --help` lists only marketplace/GitHub/Git URL sources,
+and `copilot plugin install .` fails with `Invalid plugin spec`.
 
 Agent Plugins 1.0 requires the canonical `$schema` and namespace-specific hook
 location used here. Native camelCase hooks deliver `sessionId`, `transcriptPath`,

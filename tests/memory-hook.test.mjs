@@ -59,7 +59,7 @@ test('short interaction writes metadata and no continuation', async () => {
   assert.deepEqual(await f.stop(), {});
   assert.equal((await f.state()).lastObservedTranscriptBytes, 100);
   assert.equal((await f.state()).lastCapturePromptAt, null);
-  assert.deepEqual(f.logs, []);
+  assert.equal(f.logs.at(-1).gateDecision, 'allow:below-gate');
 });
 
 test('exact size threshold triggers once; a continuation never blocks', async () => {
@@ -87,9 +87,19 @@ test('normal gate needs size AND delta AND elapsed time, including exact boundar
   await f.grow(49999);
   assert.deepEqual(await f.stop({}, start + 1800000), {});
   await f.grow(50000);
-  assert.deepEqual(await f.stop({}, start + 1800000 - 1), {});
-  assert.equal((await f.stop({}, start + 1800000)).decision, 'block');
+  assert.deepEqual(await f.stop({}, start + 3600000 - 1), {});
+  assert.equal((await f.stop({}, start + 3600000)).decision, 'block');
   assert.equal((await f.state()).lastCapturePromptBytes, 50000);
+});
+
+test('partial config inherits one-hour cooldown and debug logging defaults', async () => {
+  const f = await fixture({}, 30000);
+  assert.equal((await f.stop()).decision, 'block');
+  await writeFile(f.options.configPath, '{"enabled":true}');
+  await f.grow(50000);
+  assert.deepEqual(await f.stop({}, start + 1800000), {});
+  assert.equal(f.logs.at(-1).gateDecision, 'allow:below-gate');
+  assert.equal((await f.stop({}, start + 3600000)).decision, 'block');
 });
 
 test('minimum delta can be higher than minimum total size', async () => {
@@ -230,7 +240,7 @@ test('transcript shrink rebases byte threshold without resetting cooldown', asyn
   assert.equal((await f.state()).lastCapturePromptBytes, 0);
   await f.grow(30000);
   assert.deepEqual(await f.stop({}, start + 2), {});
-  assert.equal((await f.stop({}, start + 1800000)).decision, 'block');
+  assert.equal((await f.stop({}, start + 3600000)).decision, 'block');
 });
 
 test('clock going backwards does not bypass cooldown', async () => {
