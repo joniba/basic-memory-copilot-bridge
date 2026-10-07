@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { copyFile, mkdir, mkdtemp, readFile, readdir, stat, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -316,6 +317,31 @@ test('CLI stdin/stdout is exactly one JSON object and errors exit zero', async (
     assert.equal(result.status, 0);
     assert.deepEqual(JSON.parse(result.stdout), {});
   }
+});
+
+test('CLI preserves UTF-8 paths split across stdin chunks', async () => {
+  const f = await fixture({}, 30000);
+  const cwd = join(f.directory, 'unicode-\u{1f9e0}');
+  await mkdir(cwd);
+  const input = Buffer.from(JSON.stringify({ ...f.event, cwd }));
+  const split = input.indexOf(Buffer.from('\u{1f9e0}')) + 2;
+  const child = spawn(process.execPath, [script, 'agentStop'], {
+    env: { ...process.env, COPILOT_PLUGIN_DATA: f.options.dataDir },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk; });
+  child.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
+  const closed = once(child, 'close');
+  child.stdin.write(input.subarray(0, split));
+  await new Promise(resolve => setTimeout(resolve, 150));
+  child.stdin.end(input.subarray(split));
+  const [code] = await closed;
+  assert.equal(code, 0, stderr);
+  const result = JSON.parse(stdout);
+  assert.equal(result.decision, 'block');
+  assert.ok(result.reason.includes(JSON.stringify(cwd)));
 });
 
 test('real Windows PowerShell hook command passes stdin and paths with spaces', { skip: process.platform !== 'win32' }, async () => {

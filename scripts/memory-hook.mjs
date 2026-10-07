@@ -221,6 +221,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   let output = {};
   try {
     let input = '';
+    process.stdin.setEncoding('utf8');
     for await (const chunk of process.stdin) {
       input += chunk;
       if (input.length > 1024 * 1024) throw new Error('Oversized hook payload');

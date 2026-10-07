@@ -193,6 +193,7 @@ The suite covers exact boundaries, baseline behavior, cooldowns, loop prevention
 preCompact, configuration validation, state corruption, missing/unwritable
 files, shrinkage, concurrency, privacy, optional Git provenance, and the actual
 PowerShell command with spaces, apostrophes, and `$` in the plugin path.
+Split UTF-8 stdin chunks preserve non-ASCII path provenance.
 Fixtures are synthetic and isolated below ignored `.test-artifacts\unit-*`.
 They are retained for inspection; no user data is deleted by the test runner.
 
@@ -207,6 +208,40 @@ session and check that the pending flag clears.
 
 Live MCP writes should use one explicitly approved, clearly labeled test note.
 Do not use real sensitive work merely to fill a transcript.
+
+### Acceptance results (2026-10-07)
+
+| Case | Result |
+| --- | --- |
+| Automated suite | 41 tests pass with Node's built-in runner |
+| Fresh short session, default configuration | One response/model call; no checkpoint continuation |
+| Low-threshold live session | Next stop injects the checkpoint; exactly one additional agent turn, with no recursive continuation |
+| Useful capture | Installed skill invoked; local Basic Memory created the approved labeled test note |
+| Repeat capture | Same title, file, and `copilot:<sessionId>` updated using `overwrite: true`; one physical note exists |
+| Capture content | Synthesized current design and revised decisions; thread/session ID, CWD, repository, branch, and `test_fixture` metadata verified |
+| No useful work | Live continuation declined capture; no MCP write calls or note for the chatter session |
+| Simulated preCompact | Flag/time recorded; next live stop bypassed 1 GB size/delta gates and a 60-minute cooldown, then cleared the flag |
+| Failure cases | Corrupt/missing/unreadable state, missing transcript, invalid input/config, and unwritable data directory fail open in automated tests |
+
+The live checks used an isolated Copilot profile and a separate test mount.
+Production defaults remain 30,000 bytes / 20,000 new bytes / 30 minutes.
+No global plugin activation, MCP configuration edits, dependency changes, or
+changes to the installed upstream skill were made.
+
+An earlier test profile hit an MCP initialization error: the server reported
+protocol `2026-07-28` while Copilot requested `2025-11-25`. After the test harness
+was changed to mirror the **exact existing user MCP configuration**, including
+its local-mode environment, the bounded readiness check succeeded on its first
+call, followed by successful create/update operations. No delayed retry was
+needed. This establishes working integration, **not** the cause of the earlier
+error or proof of automatic retry recovery. No workaround was added to the
+plugin; MCP failure still skips that checkpoint normally.
+
+The approved note is retained at
+`testing\copilot-memory-bridge\Copilot Memory Bridge Acceptance Test.md` in the
+local Basic Memory project. It is explicitly marked test material rather than
+authoritative production knowledge. The simulated compaction check does not
+claim that an actual context compaction was driven end-to-end.
 
 ## API references and compatibility
 
