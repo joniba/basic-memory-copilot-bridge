@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "hooks": {
+    "agentStop": [
+      {
+        "type": "command",
+        "powershell": "node (Join-Path $env:COPILOT_PLUGIN_ROOT 'scripts\\memory-hook.mjs') agentStop",
+        "timeoutSec": 10
+      }
+    ],
+    "preCompact": [
+      {
+        "type": "command",
+        "powershell": "node (Join-Path $env:COPILOT_PLUGIN_ROOT 'scripts\\memory-hook.mjs') preCompact",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}
