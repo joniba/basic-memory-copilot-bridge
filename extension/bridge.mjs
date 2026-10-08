@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto';
-import { appendFile, mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { appendFile, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 export const defaults = Object.freeze({
@@ -57,11 +57,12 @@ function validState(state, sessionId) {
 }
 
 export class FileStateStore {
-  constructor(directory, sessionId) {
+  constructor(directory, sessionId, { legacyDirectory = null } = {}) {
     if (!sessionIdValid(sessionId)) throw new Error('session-invalid');
     this.sessionId = sessionId;
     this.directory = directory;
     this.path = join(directory, `${sessionId}.json`);
+    this.legacyDirectory = legacyDirectory;
   }
 
   async transaction(action) {
@@ -83,7 +84,10 @@ export class FileStateStore {
             .map(key => [key, state.captureInFlight[key]]));
         }
       } catch (error) {
-        if (error.code === 'ENOENT') state = freshState(this.sessionId);
+        if (error.code === 'ENOENT') {
+          state = freshState(this.sessionId);
+          if (this.legacyDirectory) state.lastOpportunityAt = await legacyOpportunity(this.legacyDirectory, this.sessionId);
+        }
         else if (error instanceof SyntaxError || error.message === 'state-invalid') {
           state = freshState(this.sessionId);
           recovered = true;
@@ -104,6 +108,38 @@ export class FileStateStore {
       }
     }
   }
+}
+
+export async function legacyOpportunity(directory, sessionId) {
+  if (!sessionIdValid(sessionId)) throw new Error('session-invalid');
+  let sources;
+  try {
+    sources = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  const filename = `${createHash('sha256').update(sessionId).digest('hex')}.json`;
+  let latest = null;
+  for (const source of sources) {
+    if (!source.isDirectory() || !/^[a-f0-9]{64}$/.test(source.name)) continue;
+    const path = join(directory, source.name, 'sessions', filename);
+    let value;
+    try {
+      if ((await stat(path)).size > 16384) throw new Error('legacy-state-invalid');
+      value = JSON.parse(await readFile(path, 'utf8'));
+    } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
+    if (!object(value) || value.sessionId !== sessionId
+      || !Object.hasOwn(value, 'baselineTranscriptBytes') || !Object.hasOwn(value, 'lastCapturePromptBytes')) continue;
+    if (value.lastCapturePromptAt === null) continue;
+    const timestamp = Date.parse(value.lastCapturePromptAt);
+    if (!count(timestamp)) throw new Error('legacy-state-invalid');
+    latest = latest === null ? timestamp : Math.max(latest, timestamp);
+  }
+  return latest;
 }
 
 export function applyUsage(state, usage, config) {
@@ -198,6 +234,8 @@ export class CaptureBridge {
     this.clock = clock;
     this.queue = Promise.resolve();
     this.usage = null;
+    this.lastMessagesLength = undefined;
+    this.lastRequest = null;
     this.context = {};
     this.compactionStarting = false;
     this.stopped = false;
@@ -219,7 +257,7 @@ export class CaptureBridge {
       await this.report('bridge', `${stage}-error`);
       if (this.lastWarningAt === null || now - this.lastWarningAt >= 60000) {
         this.lastWarningAt = now;
-        await bounded(this.session.log(`Basic Memory bridge: ${stage} failed; capture skipped.`, { level: 'warning' }));
+        await bounded(this.session.log(`Basic Memory bridge: ${stage} failed; normal session use continues.`, { level: 'warning' }));
       }
     } catch {
       // Last-resort diagnostic contains no SDK errors, paths, or event payloads.
@@ -278,20 +316,38 @@ export class CaptureBridge {
     const info = result.contextInfo;
     if (info === null || info === undefined) return;
     if (!count(info.totalTokens) || !count(info.limit) || info.limit === 0) throw new Error('usage-invalid');
-    this.usage = { currentTokens: info.totalTokens, tokenLimit: info.limit };
+    this.usage = {
+      currentTokens: info.totalTokens, tokenLimit: info.limit,
+      ...(this.lastMessagesLength === undefined ? {} : { messagesLength: this.lastMessagesLength }),
+    };
   }
 
   async pendingFlight(flight) {
-    if (!flight.messageId) return null;
     const pending = await bounded(this.session.rpc.queue.pendingItems());
-    return pending.items.find(item => item.messageId === flight.messageId) ?? null;
+    return pending.items.find(item => (flight.messageId && item.messageId === flight.messageId)
+      || (item.source === 'system' && item.displayText === `Basic Memory checkpoint: ${flight.id}`)) ?? null;
   }
 
   async finish(state, decision) {
+    const accepted = state.captureInFlight?.messageId !== null;
     state.captureInFlight = null;
+    this.lastRequest = null;
+    if (!accepted) {
+      state.retryAfter = this.clock() + 60000;
+      await this.report('session.idle', 'unconfirmed-request-reconciled');
+      return;
+    }
     state.lastOpportunityTokens = state.lastContextTokens;
     if (state.lastContextTokens !== null) state.baselineTokens = state.lastContextTokens;
     await this.report('session.idle', decision);
+  }
+
+  acceptOffer(state, offer, messageId) {
+    if (state.captureInFlight?.id !== offer.id || state.captureInFlight.messageId === messageId) return;
+    state.captureInFlight.messageId = messageId;
+    state.lastOpportunityAt = this.clock();
+    state.lastOpportunityTokens = state.lastContextTokens;
+    if (offer.kind === 'pressure') state.pressureOpportunityEpoch = offer.epoch;
   }
 
   async handle(event) {
@@ -309,10 +365,14 @@ export class CaptureBridge {
       if (!count(event.data.currentTokens) || !count(event.data.tokenLimit) || event.data.tokenLimit === 0) {
         this.usage = null;
         await this.warn('usage');
-      } else this.usage = {
-        currentTokens: event.data.currentTokens, tokenLimit: event.data.tokenLimit,
-        ...(count(event.data.messagesLength) ? { messagesLength: event.data.messagesLength } : {}),
-      };
+      } else {
+        if (count(event.data.messagesLength)) this.lastMessagesLength = event.data.messagesLength;
+        this.usage = {
+          currentTokens: event.data.currentTokens, tokenLimit: event.data.tokenLimit,
+          ...(this.lastMessagesLength === undefined ? {} : { messagesLength: this.lastMessagesLength }),
+        };
+        await this.report(event.type, 'usage-observed', config);
+      }
       return;
     }
     if (event.type === 'session.shutdown') {
@@ -327,16 +387,25 @@ export class CaptureBridge {
       'session.compaction_complete', 'session.context_cleared'].includes(event.type)) return;
     if (event.type === 'session.idle') await this.refreshUsage();
     let offer;
-    let previous;
     await this.store.transaction(async (state, recovered) => {
       if (this.usage && !state.compacting) applyUsage(state, this.usage, config);
       if (event.type === 'user.message') {
-        if (state.captureInFlight?.messageId === event.data.messageId) state.captureInFlight.started = true;
+        const flight = state.captureInFlight ?? this.lastRequest;
+        if (flight && typeof event.data.messageId === 'string'
+          && (flight.messageId === event.data.messageId
+            || (event.data.source === 'system' && event.data.content === `Basic Memory checkpoint: ${flight.id}`))) {
+          state.captureInFlight ??= { ...flight };
+          this.acceptOffer(state, flight, event.data.messageId);
+          state.captureInFlight.started = true;
+        }
         return;
       }
       if (event.type === 'session.compaction_start') {
         state.compacting = true;
-        if (state.pressurePending || state.captureInFlight) await this.report(event.type, 'missed-pre-compaction', config);
+        if ((state.pressurePending && state.pressureOpportunityEpoch !== state.compactionEpoch)
+          || (state.captureInFlight && !state.captureInFlight.started)) {
+          await this.report(event.type, 'missed-pre-compaction', config);
+        } else await this.report(event.type, state.captureInFlight ? 'compaction-during-checkpoint' : 'compaction-start', config);
         if (state.captureInFlight && !state.captureInFlight.started) {
           const item = await this.pendingFlight(state.captureInFlight);
           if (item) {
@@ -405,43 +474,37 @@ export class CaptureBridge {
       offer = {
         id: randomUUID(), kind: decision, epoch: state.compactionEpoch, messageId: null, started: false,
       };
-      previous = {
-        at: state.lastOpportunityAt, tokens: state.lastOpportunityTokens, pressure: state.pressureOpportunityEpoch,
-      };
       state.captureInFlight = offer;
-      state.lastOpportunityAt = this.clock();
-      state.lastOpportunityTokens = state.lastContextTokens;
-      if (decision === 'pressure') state.pressureOpportunityEpoch = state.compactionEpoch;
+      this.lastRequest = offer;
     });
     if (!offer) return;
     if (this.compactionStarting) {
       await this.store.transaction(state => {
         if (state.captureInFlight?.id === offer.id) {
           state.captureInFlight = null;
-          state.lastOpportunityAt = previous.at;
-          state.lastOpportunityTokens = previous.tokens;
-          state.pressureOpportunityEpoch = previous.pressure;
         }
       });
       await this.report(event.type, 'missed-pre-compaction', config);
       return;
     }
+    let accepted = false;
     try {
       const messageId = await bounded(this.session.send({
         prompt: checkpointPrompt(this.session.sessionId, this.context), source: 'system', mode: 'enqueue',
+        displayPrompt: `Basic Memory checkpoint: ${offer.id}`,
       }), 30000);
       if (typeof messageId !== 'string' || !messageId.length) throw new Error('message-id-invalid');
-      await this.store.transaction(state => {
-        if (state.captureInFlight?.id === offer.id) state.captureInFlight.messageId = messageId;
-      });
+      accepted = true;
+      await this.store.transaction(state => this.acceptOffer(state, offer, messageId));
       await this.report(event.type, `offered:${offer.kind}`, config);
     } catch {
+      if (accepted) {
+        await this.warn('state');
+        return;
+      }
       await this.store.transaction(state => {
         if (state.captureInFlight?.id === offer.id) {
           state.captureInFlight = null;
-          state.lastOpportunityAt = previous.at;
-          state.lastOpportunityTokens = previous.tokens;
-          state.pressureOpportunityEpoch = previous.pressure;
           state.retryAfter = this.clock() + 60000;
         }
       });

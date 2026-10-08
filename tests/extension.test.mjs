@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -69,6 +70,29 @@ test('production config matches code defaults and native thresholds', async () =
   assert.equal(defaults.minimumMinutesBetweenOpportunities, 60);
   assert.equal(defaults.pressureMinimumMinutesBetweenOpportunities, 5);
   assert.equal(defaults.debugLogging, true);
+});
+
+test('cutover imports only the previous offer time, not byte watermarks', async () => {
+  const directory = await mkdtemp(join(run, 'migration-'));
+  const legacyDirectory = join(directory, 'legacy');
+  const oldSessions = join(legacyDirectory, 'a'.repeat(64), 'sessions');
+  await mkdir(oldSessions, { recursive: true });
+  const hash = createHash('sha256').update('test-session').digest('hex');
+  await writeFile(join(oldSessions, `${hash}.json`), JSON.stringify({
+    sessionId: 'test-session', baselineTranscriptBytes: 9000000, lastCapturePromptBytes: 9500000,
+    lastCapturePromptAt: new Date(start).toISOString(),
+  }));
+  const store = new FileStateStore(join(directory, 'native'), 'test-session', { legacyDirectory });
+  await store.transaction(state => {
+    assert.equal(state.lastOpportunityAt, start);
+    assert.equal(state.lastOpportunityTokens, null);
+    applyUsage(state, { currentTokens: 1000, tokenLimit: 200000 }, defaults);
+  });
+  await store.transaction(state => {
+    applyUsage(state, { currentTokens: 51000, tokenLimit: 200000 }, defaults);
+    assert.equal(eligibility(state, defaults, start + 3599999), 'below-gate');
+    assert.equal(eligibility(state, defaults, start + 3600000), 'periodic');
+  });
 });
 
 for (const config of [null, [], { typo: true }, { periodicMinimumNewTokens: -1 },
@@ -146,6 +170,14 @@ test('no native data skips even when persisted usage would qualify', async () =>
   assert.equal(f.logs.at(-1).gateDecision, 'usage-unavailable');
 });
 
+test('on-demand refresh preserves the last native message count', async () => {
+  const f = await fixture();
+  await f.event('session.usage_info', { currentTokens: 1000, tokenLimit: 200000, messagesLength: 7 });
+  await f.idle();
+  assert.equal((await f.state()).lastSeenMessagesLength, 7);
+  assert.ok(f.logs.some(row => row.event === 'session.usage_info' && row.gateDecision === 'usage-observed'));
+});
+
 test('aborted, subagent, busy and disabled idles do not send', async () => {
   const f = await fixture();
   f.info({ totalTokens: 65000, limit: 100000 });
@@ -175,6 +207,62 @@ test('failed send retries only after short backoff, without consuming pressure e
   await f.idle();
   assert.equal(f.sent.length, 1);
   assert.ok(!JSON.stringify([f.logs, f.warnings]).includes('private error'));
+});
+
+test('reservation is not an opportunity until the SDK accepts the send', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 65000, limit: 100000 });
+  let entered;
+  let accept;
+  const sending = new Promise(resolve => { entered = resolve; });
+  f.session.send = async options => {
+    f.sent.push(options);
+    entered();
+    return new Promise(resolve => { accept = resolve; });
+  };
+  const idle = f.idle();
+  await sending;
+  const reserved = await f.state();
+  assert.equal(reserved.lastOpportunityAt, null);
+  assert.equal(reserved.pressureOpportunityEpoch, null);
+  assert.notEqual(reserved.captureInFlight, null);
+  accept('accepted-message');
+  await idle;
+  assert.equal((await f.state()).lastOpportunityAt, start);
+  assert.equal((await f.state()).pressureOpportunityEpoch, 0);
+});
+
+test('unconfirmed reservation on resume does not claim a delivered opportunity', async () => {
+  const f = await fixture();
+  await f.store.transaction(state => {
+    state.captureInFlight = { id: 'pending-request', kind: 'periodic', epoch: 0, messageId: null, started: false };
+  });
+  await f.reload();
+  await f.idle();
+  const state = await f.state();
+  assert.equal(state.captureInFlight, null);
+  assert.equal(state.lastOpportunityAt, null);
+  assert.equal(state.retryAfter, start + 60000);
+});
+
+test('native receipt reconciles an accepted request whose state acknowledgement failed', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 65000, limit: 100000 });
+  const transaction = f.store.transaction.bind(f.store);
+  let writes = 0;
+  f.store.transaction = action => {
+    writes += 1;
+    if (writes === 2) return Promise.reject(new Error('synthetic state acknowledgement failure'));
+    return transaction(action);
+  };
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).lastOpportunityAt, null);
+  await f.event('user.message', { source: 'system', messageId: 'message-1', content: f.sent[0].displayPrompt });
+  assert.equal((await f.state()).lastOpportunityAt, start);
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).captureInFlight, null);
 });
 
 test('compaction records missed opportunity and does not replay a recovery checkpoint', async () => {
@@ -252,6 +340,17 @@ test('failed compaction clears busy guard without advancing epoch', async () => 
   await f.event('session.compaction_complete', { success: false });
   assert.equal((await f.state()).compactionEpoch, 0);
   assert.equal((await f.state()).compacting, false);
+});
+
+test('already offered pressure checkpoint is not falsely reported as missed', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 65000, limit: 100000 });
+  await f.idle();
+  await f.event('user.message', { messageId: 'message-1' });
+  await f.idle();
+  await f.event('session.compaction_start');
+  assert.ok(!f.logs.some(row => row.gateDecision === 'missed-pre-compaction'));
+  assert.equal(f.logs.at(-1).gateDecision, 'compaction-start');
 });
 
 test('reload reconciles completed request and preserves cooldown and watermark', async () => {

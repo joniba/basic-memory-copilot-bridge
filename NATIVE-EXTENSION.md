@@ -56,6 +56,10 @@ model/tool costs and permission behavior still apply. The agent invokes the
 existing skill if useful and may decline to write. The prompt preserves
 `thread_id: copilot:<sessionId>` and available native repository context.
 It does not impose a new Basic Memory project-routing policy.
+The timeline labels each automatic request as a Basic Memory checkpoint.
+Reservations are not counted as opportunities until the SDK accepts the send.
+One-shot `-p` mode can terminate during idle follow-up delivery; it is not a
+substitute for testing a long-running interactive session.
 
 ## State, diagnostics, and disable
 
@@ -68,7 +72,9 @@ extension-state\basic-memory-bridge\logs\<sessionId>.jsonl
 
 State records opportunities, not successful writes. It survives resume/reload,
 reconciles in-flight requests, and excludes checkpoint-turn growth from the
-next periodic watermark. A short-lived exclusive lock and atomic replacement
+next periodic watermark. At first cutover, an existing plugin opportunity time
+for the same session is imported to preserve cooldown; byte watermarks are
+never interpreted as tokens. A short-lived exclusive lock and atomic replacement
 protect each state file; a leftover lock fails open and requires owner-checked
 manual recovery rather than automatic age-based removal.
 

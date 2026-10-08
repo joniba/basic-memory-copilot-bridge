@@ -13,7 +13,9 @@ try {
   const stateRoot = join(home, 'extension-state', 'basic-memory-bridge');
   const bridge = new CaptureBridge({
     session,
-    store: new FileStateStore(join(stateRoot, 'sessions'), session.sessionId),
+    store: new FileStateStore(join(stateRoot, 'sessions'), session.sessionId, {
+      legacyDirectory: join(home, 'plugin-data', '_direct'),
+    }),
     config: async () => validateConfig(JSON.parse(await readFile(join(root, 'config.json'), 'utf8'))),
     log: createLogger(join(stateRoot, 'logs'), session.sessionId),
   });
