@@ -93,3 +93,16 @@ node --test --test-reporter=spec .\tests\extension.test.mjs
 Production thresholds are unchanged by tests. Live Windows checks must also
 prove same-visible-session delivery, actual local BM writes and same-note
 updates, pressure/missed-compaction behavior, and resume/clear/concurrency.
+
+Interactive smoke testing confirmed a same-session pressure follow-up,
+`memory-capture` invocation, and successful local BM diagnostics/search.
+The user cancelled the write request: no note was created, in-flight state
+cleared, and no recursive checkpoint followed. Successful/repeated writes
+and the remaining live acceptance cases are not yet verified.
+
+Fresh isolated CLI homes can re-run Windows Terminal keybinding setup.
+Preserve the existing `askedSetupTerminals` machine-setup observation in the
+test home's config to avoid repeating it; do not copy credentials or change
+Terminal settings/permissions. A transient MCP handshake failure in this
+smoke run retried and recovered before the extension joined; its root cause
+is not established.
