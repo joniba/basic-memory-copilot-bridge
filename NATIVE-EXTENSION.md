@@ -1,10 +1,11 @@
 # Native Basic Memory bridge
 
-The candidate under `extension\` joins the existing interactive Copilot CLI
+The extension under `extension\` joins the existing interactive Copilot CLI
 session using its bundled SDK. It adds no tools, shell hooks, MCP server,
 custom skill, or independent model client. It is not activated by checking
-out this repository. Native SDK types were checked against CLI 1.0.93-2;
-live acceptance is required before retiring the old plugin.
+out this repository. Native SDK types and interactive delivery were checked
+against CLI 1.0.93-2. The shell-hook plugin is retired; its source remains
+available in Git history.
 
 ## Install without dual-running
 
@@ -12,8 +13,11 @@ The upstream `memory-capture` skill and local Basic Memory MCP must already
 be available independently.
 
 ```powershell
+# Only for existing legacy installs; close affected CLI sessions first:
 copilot plugin disable basic-memory-copilot
-# Restart affected running CLI sessions and verify old capture hooks are inactive.
+copilot plugin uninstall basic-memory-copilot
+
+# From the extracted repository directory:
 .\scripts\install-extension.ps1
 copilot --experimental
 ```
@@ -23,6 +27,7 @@ Installation copies the three runtime files into
 It refuses an enabled old plugin or an existing destination instead of
 overwriting another installation. Do not globally reload unrelated extensions
 to activate this bridge. A new process is the controlled activation path.
+The old plugin's scripts, manifest, config, and tests are no longer shipped.
 
 ## Settings and behavior
 
@@ -97,8 +102,9 @@ updates, pressure/missed-compaction behavior, and resume/clear/concurrency.
 Interactive smoke testing confirmed a same-session pressure follow-up,
 `memory-capture` invocation, and successful local BM diagnostics/search.
 The user cancelled the write request: no note was created, in-flight state
-cleared, and no recursive checkpoint followed. Successful/repeated writes
-and the remaining live acceptance cases are not yet verified.
+cleared, and no recursive checkpoint followed. Successful/repeated fixture
+writes were explicitly skipped at the user's request. Remaining unexercised
+live cases are not implied by logic-test coverage.
 
 Fresh isolated CLI homes can re-run Windows Terminal keybinding setup.
 Preserve the existing `askedSetupTerminals` machine-setup observation in the
