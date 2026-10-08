@@ -45,6 +45,10 @@ The installer copies the three runtime files under `extension\` to
 The SDK is supplied by Copilot; no package installation is needed. Checking
 out this repository alone does not activate the extension.
 
+**The token status line is optional and is not installed by
+`install-extension.ps1`.** To add it, follow
+[Optional token status line](#optional-token-status-line) below.
+
 If migrating from `basic-memory-copilot`, close affected CLI sessions, disable
 and uninstall that old plugin first, then install the extension and start a
 fresh CLI. The installer refuses an enabled old plugin or an existing target
@@ -68,6 +72,57 @@ Capture before every compaction is not guaranteed.
 
 Edit the installed `config.json`, not the checkout. Capture and bounded debug
 logging are enabled by default. Set `enabled: false` to stop new automatic offers.
+
+## Optional token status line
+
+The token display is a **separate status-line script**, not part of the
+long-running BM extension. Installing or reloading that extension does not
+enable the display. From the extracted repository directory, run this
+additional installer once:
+
+```powershell
+.\scripts\install-statusline.ps1
+```
+
+It preserves the existing custom renderer and appends the labeled badge:
+
+```text
+[existing status] | tokens: 205K (81%)
+```
+
+Without a previous renderer, the output is just `tokens: 205K (81%)`.
+If a renderer is configured, its output is retained without modifying its
+code. Extension load order does not affect composition.
+
+Once configured, **Copilot runs the script automatically on status-line
+refreshes**. It uses the current native context-token count and selected
+context tier's limit, not billed tokens or BM capture state. Missing token
+data hides only the badge. No polling, MCP requests, or model calls are added.
+
+### Already-open CLI sessions
+
+New sessions read the installed command from user settings. An already-open
+session may still have the previous command in memory. To reload its live
+settings without restarting, enter this at the Copilot prompt:
+
+```text
+/settings statusLine.padding 0
+```
+
+This sets left padding to zero; if you use custom padding, substitute that
+value. Reloading extensions alone does not refresh the status-line command.
+Future edits to the installed script or its companion config take effect
+on the next status-line refresh without an extension reload.
+
+The companion is installed under
+`%USERPROFILE%\.copilot\statusline\context-tokens` (or `COPILOT_HOME`), separately
+from the BM extension. Its `config.json` saves the previous renderer and has
+`showTokens: true`; set that to `false` to keep only the previous output.
+The installer preserves unrelated settings, padding, and refresh interval,
+and refuses an existing installation rather than overwriting or nesting it.
+
+See [the status-line guide](STATUSLINE.md) for restoration, formatting, and
+failure behavior. This optional component does not change automatic capture.
 
 ## Capture identity and privacy
 
