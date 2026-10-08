@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "periodicMinimumNewTokens": 50000,
+  "minimumMinutesBetweenOpportunities": 60,
+  "contextPressureThreshold": 0.65,
+  "pressureMinimumMinutesBetweenOpportunities": 5,
+  "debugLogging": true
+}

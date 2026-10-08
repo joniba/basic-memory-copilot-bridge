@@ -1,8 +1,0 @@
-{
-  "enabled": true,
-  "minimumTranscriptBytes": 30000,
-  "minimumDeltaBytes": 20000,
-  "minimumMinutesBetweenPrompts": 60,
-  "captureAfterPreCompact": true,
-  "debugLogging": true
-}

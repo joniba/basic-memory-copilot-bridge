@@ -1,8 +1,0 @@
-{
-  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
-  "name": "basic-memory-copilot",
-  "version": "0.1.0",
-  "description": "Cheap, local checkpoint opportunities for the installed Basic Memory memory-capture skill.",
-  "repository": "https://github.com/joniba/basic-memory-copilot-bridge",
-  "keywords": ["basic-memory", "memory-capture", "hooks"]
-}
