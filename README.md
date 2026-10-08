@@ -1,5 +1,9 @@
 # Basic Memory Copilot bridge
 
+**Native extension migration:** an initially inactive candidate is available
+under `extension\`. See [native extension documentation](NATIVE-EXTENSION.md).
+Do not run it alongside the plugin described below.
+
 A Windows-only Copilot plugin that occasionally asks the active model to
 consider the installed Basic Memory `memory-capture` skill. The hook itself
 does no summarization, reads no transcript contents, and calls no model or MCP.
