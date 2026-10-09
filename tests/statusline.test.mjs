@@ -15,10 +15,26 @@ const input = (tokens = 205000, limit = 253000) => ({
   context_window: { current_context_tokens: tokens, displayed_context_limit: limit },
 });
 const config = { previousStatusLine: { command: 'synthetic-renderer' }, showTokens: true };
+const badge81 = 'tokens: 205K (\u001b[31m81% - compaction imminent\u001b[39m)';
 
 test('requested format has explicit token label and rounded utilization', () => {
-  assert.equal(tokenBadge(input()), 'tokens: 205K (81%)');
-  assert.equal(compose('[existing]', tokenBadge(input())), '[existing] | tokens: 205K (81%)');
+  assert.equal(tokenBadge(input()), badge81);
+  assert.equal(compose('[existing]', tokenBadge(input())), `[existing] | ${badge81}`);
+});
+
+test('percentage and warning are yellow at 60 percent and red at 70 percent', () => {
+  assert.equal(tokenBadge(input(59000, 100000)), 'tokens: 59K (59%)');
+  assert.equal(tokenBadge(input(60000, 100000)), 'tokens: 60K (\u001b[33m60% - nearing compaction\u001b[39m)');
+  assert.equal(tokenBadge(input(69000, 100000)), 'tokens: 69K (\u001b[33m69% - nearing compaction\u001b[39m)');
+  assert.equal(tokenBadge(input(70000, 100000)), 'tokens: 70K (\u001b[31m70% - compaction imminent\u001b[39m)');
+  assert.equal(tokenBadge(input(71000, 100000)), 'tokens: 71K (\u001b[31m71% - compaction imminent\u001b[39m)');
+});
+
+test('color thresholds match the displayed rounded percentage', () => {
+  assert.equal(tokenBadge(input(59499, 100000)), 'tokens: 59K (59%)');
+  assert.equal(tokenBadge(input(59500, 100000)), 'tokens: 60K (\u001b[33m60% - nearing compaction\u001b[39m)');
+  assert.equal(tokenBadge(input(69499, 100000)), 'tokens: 69K (\u001b[33m69% - nearing compaction\u001b[39m)');
+  assert.equal(tokenBadge(input(69500, 100000)), 'tokens: 70K (\u001b[31m70% - compaction imminent\u001b[39m)');
 });
 
 test('current context is used instead of billed or last-call token totals', () => {
@@ -27,7 +43,7 @@ test('current context is used instead of billed or last-call token totals', () =
   data.context_window.last_call_input_tokens = 123;
   data.context_window.used_percentage = 17;
   data.context_window.context_window_size = 1000000;
-  assert.equal(tokenBadge(data), 'tokens: 205K (81%)');
+  assert.equal(tokenBadge(data), badge81);
 });
 
 test('zero, sub-thousand and thousand-rounding boundaries are meaningful', () => {
@@ -39,7 +55,7 @@ test('zero, sub-thousand and thousand-rounding boundaries are meaningful', () =>
 });
 
 test('overfull context is not hidden by clamping and model/tier limits can change', () => {
-  assert.equal(tokenBadge(input(120000, 100000)), 'tokens: 120K (120%)');
+  assert.equal(tokenBadge(input(120000, 100000)), 'tokens: 120K (\u001b[31m120% - compaction imminent\u001b[39m)');
   assert.equal(tokenBadge(input(205000, 1000000)), 'tokens: 205K (21%)');
 });
 
@@ -68,11 +84,11 @@ test('previous output and native JSON are preserved, including additional and Un
     return { status: 0, stdout: '\u001b[32m[existing]\u001b[0m\nnext line\n' };
   } });
   assert.equal(forwarded, text);
-  assert.equal(result, '\u001b[32m[existing]\u001b[0m\nnext line | tokens: 205K (81%)');
+  assert.equal(result, `\u001b[32m[existing]\u001b[0m\nnext line | ${badge81}`);
 });
 
 test('empty/unconfigured prior renderer shows badge without a separator', () => {
-  assert.equal(renderStatusLine(JSON.stringify(input()), { previousStatusLine: null, showTokens: true }), 'tokens: 205K (81%)');
+  assert.equal(renderStatusLine(JSON.stringify(input()), { previousStatusLine: null, showTokens: true }), badge81);
   assert.equal(compose('', ''), '');
 });
 
@@ -99,7 +115,7 @@ test('delegate failures and timeout diagnostics never expose command/error conte
     const warnings = [];
     assert.equal(renderStatusLine(JSON.stringify(input()), config, {
       run: () => result, warn: code => warnings.push(code),
-    }), 'tokens: 205K (81%)');
+    }), badge81);
     assert.equal(warnings.length, 1);
     assert.ok(!JSON.stringify(warnings).includes('private'));
   }
@@ -110,7 +126,7 @@ test('delegate spawn exceptions preserve the native badge and log only a fixed c
   assert.equal(renderStatusLine(JSON.stringify(input()), config, {
     run: () => { throw new Error('synthetic-private-spawn-message'); },
     warn: code => warnings.push(code),
-  }), 'tokens: 205K (81%)');
+  }), badge81);
   assert.deepEqual(warnings, ['previous-command-error']);
 });
 
@@ -145,7 +161,7 @@ test('real child command receives session JSON and outputs composed text from a 
   const result = spawnSync(process.execPath, [compositor], { input: JSON.stringify(input()), encoding: 'utf8', timeout: 5000 });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stderr, '');
-  assert.equal(result.stdout, '[synthetic-session] | tokens: 205K (81%)');
+  assert.equal(result.stdout, `[synthetic-session] | ${badge81}`);
 });
 
 test('Windows installer preserves unrelated JSONC settings, padding and refresh configuration', { skip: process.platform !== 'win32' }, async () => {

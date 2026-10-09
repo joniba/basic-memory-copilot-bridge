@@ -17,7 +17,9 @@ export function tokenBadge(status) {
   const tokens = context.current_context_tokens;
   const percentage = Math.round(tokens / context.displayed_context_limit * 100);
   const amount = tokens < 1000 ? String(tokens) : `${Math.round(tokens / 1000)}K`;
-  return `tokens: ${amount} (${percentage}%)`;
+  const color = percentage >= 70 ? '\u001b[31m' : percentage >= 60 ? '\u001b[33m' : '';
+  const warning = percentage >= 70 ? ' - compaction imminent' : percentage >= 60 ? ' - nearing compaction' : '';
+  return `tokens: ${amount} (${color}${percentage}%${warning}${color ? '\u001b[39m' : ''})`;
 }
 
 export function compose(previous, badge) {

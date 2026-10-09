@@ -87,10 +87,10 @@ additional installer once:
 It preserves the existing custom renderer and appends the labeled badge:
 
 ```text
-[existing status] | tokens: 205K (81%)
+[existing status] | tokens: 205K (81% - compaction imminent)
 ```
 
-Without a previous renderer, the output is just `tokens: 205K (81%)`.
+Without a previous renderer, the output contains only the token badge.
 If a renderer is configured, its output is retained without modifying its
 code. Extension load order does not affect composition.
 
@@ -98,6 +98,11 @@ Once configured, **Copilot runs the script automatically on status-line
 refreshes**. It uses the current native context-token count and selected
 context tier's limit, not billed tokens or BM capture state. Missing token
 data hides only the badge. No polling, MCP requests, or model calls are added.
+The percentage and warning are yellow at **60-69%** (`60% - nearing compaction`)
+and red at **70% or more** (`71% - compaction imminent`). Below 60%, the
+percentage is uncolored and has no warning. Colors and labels follow the
+displayed rounded percentage; the red label is an early warning, not a
+guarantee of the CLI's actual compaction timing.
 
 ### Already-open CLI sessions
 
