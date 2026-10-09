@@ -3,7 +3,7 @@
 This optional companion uses Copilot's native status JSON to append a badge:
 
 ```text
-[existing status] | tokens: 205K (81%)
+[existing status] | tokens: 205K (81% - compaction imminent)
 ```
 
 It delegates to the previously configured status-line command with the same
@@ -55,6 +55,13 @@ matches the selected context tier's display denominator, not cumulative
 billing tokens, the last API call, or the advertised combined input/output
 ceiling. Counts at or above 1,000 round to whole decimal K; the percentage
 rounds to a whole number. An overfull context is not silently clamped.
+The percentage and warning use ANSI foreground color: yellow for displayed
+60-69% with `nearing compaction`, red for 70% or higher with `compaction imminent`,
+and the default foreground with no warning below 60%. The token count and
+parentheses are unchanged; foreground color resets after the warning.
+These display thresholds do not inspect the CLI's compaction scheduler.
+`Compaction imminent` is an early-warning label, not a guarantee of actual
+compaction timing.
 
 Missing/invalid native counts omit **only** the badge; previous output stays.
 The same applies when `showTokens` is false. The previous command's multiline
