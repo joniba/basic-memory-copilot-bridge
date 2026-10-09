@@ -15,7 +15,7 @@ const input = (tokens = 205000, limit = 253000) => ({
   context_window: { current_context_tokens: tokens, displayed_context_limit: limit },
 });
 const config = { previousStatusLine: { command: 'synthetic-renderer' }, showTokens: true };
-const badge81 = 'tokens: 205K (\u001b[31m81% - compaction imminent\u001b[39m)';
+const badge81 = 'tokens: 205K (\u001b[31m81% \u2014 compaction imminent\u001b[39m)';
 
 test('requested format has explicit token label and rounded utilization', () => {
   assert.equal(tokenBadge(input()), badge81);
@@ -23,18 +23,18 @@ test('requested format has explicit token label and rounded utilization', () => 
 });
 
 test('percentage and warning are yellow at 60 percent and red at 70 percent', () => {
-  assert.equal(tokenBadge(input(59000, 100000)), 'tokens: 59K (59%)');
-  assert.equal(tokenBadge(input(60000, 100000)), 'tokens: 60K (\u001b[33m60% - nearing compaction\u001b[39m)');
-  assert.equal(tokenBadge(input(69000, 100000)), 'tokens: 69K (\u001b[33m69% - nearing compaction\u001b[39m)');
-  assert.equal(tokenBadge(input(70000, 100000)), 'tokens: 70K (\u001b[31m70% - compaction imminent\u001b[39m)');
-  assert.equal(tokenBadge(input(71000, 100000)), 'tokens: 71K (\u001b[31m71% - compaction imminent\u001b[39m)');
+  assert.equal(tokenBadge(input(59000, 100000)), 'tokens: 59K (\u001b[37m59%\u001b[39m)');
+  assert.equal(tokenBadge(input(60000, 100000)), 'tokens: 60K (\u001b[33m60% \u2014 nearing compaction\u001b[39m)');
+  assert.equal(tokenBadge(input(69000, 100000)), 'tokens: 69K (\u001b[33m69% \u2014 nearing compaction\u001b[39m)');
+  assert.equal(tokenBadge(input(70000, 100000)), 'tokens: 70K (\u001b[31m70% \u2014 compaction imminent\u001b[39m)');
+  assert.equal(tokenBadge(input(71000, 100000)), 'tokens: 71K (\u001b[31m71% \u2014 compaction imminent\u001b[39m)');
 });
 
 test('color thresholds match the displayed rounded percentage', () => {
-  assert.equal(tokenBadge(input(59499, 100000)), 'tokens: 59K (59%)');
-  assert.equal(tokenBadge(input(59500, 100000)), 'tokens: 60K (\u001b[33m60% - nearing compaction\u001b[39m)');
-  assert.equal(tokenBadge(input(69499, 100000)), 'tokens: 69K (\u001b[33m69% - nearing compaction\u001b[39m)');
-  assert.equal(tokenBadge(input(69500, 100000)), 'tokens: 70K (\u001b[31m70% - compaction imminent\u001b[39m)');
+  assert.equal(tokenBadge(input(59499, 100000)), 'tokens: 59K (\u001b[37m59%\u001b[39m)');
+  assert.equal(tokenBadge(input(59500, 100000)), 'tokens: 60K (\u001b[33m60% \u2014 nearing compaction\u001b[39m)');
+  assert.equal(tokenBadge(input(69499, 100000)), 'tokens: 69K (\u001b[33m69% \u2014 nearing compaction\u001b[39m)');
+  assert.equal(tokenBadge(input(69500, 100000)), 'tokens: 70K (\u001b[31m70% \u2014 compaction imminent\u001b[39m)');
 });
 
 test('current context is used instead of billed or last-call token totals', () => {
@@ -47,16 +47,16 @@ test('current context is used instead of billed or last-call token totals', () =
 });
 
 test('zero, sub-thousand and thousand-rounding boundaries are meaningful', () => {
-  assert.equal(tokenBadge(input(0, 100000)), 'tokens: 0 (0%)');
-  assert.equal(tokenBadge(input(999, 100000)), 'tokens: 999 (1%)');
-  assert.equal(tokenBadge(input(1000, 100000)), 'tokens: 1K (1%)');
-  assert.equal(tokenBadge(input(205499, 1000000)), 'tokens: 205K (21%)');
-  assert.equal(tokenBadge(input(205500, 1000000)), 'tokens: 206K (21%)');
+  assert.equal(tokenBadge(input(0, 100000)), 'tokens: 0 (\u001b[37m0%\u001b[39m)');
+  assert.equal(tokenBadge(input(999, 100000)), 'tokens: 999 (\u001b[37m1%\u001b[39m)');
+  assert.equal(tokenBadge(input(1000, 100000)), 'tokens: 1K (\u001b[37m1%\u001b[39m)');
+  assert.equal(tokenBadge(input(205499, 1000000)), 'tokens: 205K (\u001b[37m21%\u001b[39m)');
+  assert.equal(tokenBadge(input(205500, 1000000)), 'tokens: 206K (\u001b[37m21%\u001b[39m)');
 });
 
 test('overfull context is not hidden by clamping and model/tier limits can change', () => {
-  assert.equal(tokenBadge(input(120000, 100000)), 'tokens: 120K (\u001b[31m120% - compaction imminent\u001b[39m)');
-  assert.equal(tokenBadge(input(205000, 1000000)), 'tokens: 205K (21%)');
+  assert.equal(tokenBadge(input(120000, 100000)), 'tokens: 120K (\u001b[31m120% \u2014 compaction imminent\u001b[39m)');
+  assert.equal(tokenBadge(input(205000, 1000000)), 'tokens: 205K (\u001b[37m21%\u001b[39m)');
 });
 
 for (const data of [null, {}, { context_window: {} }, input(null), input(-1), input(1.5),
@@ -156,6 +156,7 @@ test('real child command receives session JSON and outputs composed text from a 
   await writeFile(previous, "let text=''; process.stdin.setEncoding('utf8'); for await(const part of process.stdin) text+=part; const data=JSON.parse(text); process.stdout.write(`[${data.session_id}]`);\n");
   const compositor = join(directory, 'statusline.mjs');
   await copyFile(join(root, 'statusline', 'statusline.mjs'), compositor);
+  await copyFile(join(root, 'statusline', 'contributions.mjs'), join(directory, 'contributions.mjs'));
   const command = `"${process.execPath}" "${previous}"`;
   await writeFile(join(directory, 'config.json'), JSON.stringify({ previousStatusLine: { command }, showTokens: true }));
   const result = spawnSync(process.execPath, [compositor], { input: JSON.stringify(input()), encoding: 'utf8', timeout: 5000 });
@@ -198,6 +199,7 @@ for (const original of [
   '{"theme":"dim",}',
   '{"statusLine":null,"theme":"dim"}',
   '{"statusLine":{"padding":2,},"theme":"dim"}',
+  '{"statusLine":{"refreshInterval":null},"theme":"dim"}',
   '{"statusLine":{/* keep empty group comment */},"theme":"dim"}',
   '{"other":{"statusLine":{"command":"nested"}},"theme":"dim"}',
 ]) {
@@ -213,6 +215,7 @@ for (const original of [
     assert.equal(verify.status, 0, verify.stderr);
     const settings = JSON.parse(verify.stdout);
     assert.ok(settings.statusLine.command.includes('context-tokens'));
+    assert.equal(settings.statusLine.refreshInterval, 2);
     assert.equal(settings.theme, original.includes('"theme"') ? 'dim' : undefined);
     if (original.includes('"nested"')) assert.equal(settings.other.statusLine.command, 'nested');
     if (original.includes('padding')) assert.equal(settings.statusLine.padding, 2);

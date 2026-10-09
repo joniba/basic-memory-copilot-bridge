@@ -22,7 +22,7 @@ copilot plugin uninstall basic-memory-copilot
 copilot --experimental
 ```
 
-Installation copies the three runtime files into
+Installation copies the four runtime files into
 `%USERPROFILE%\.copilot\extensions\basic-memory-bridge` (or `COPILOT_HOME`).
 It refuses an enabled old plugin or an existing destination instead of
 overwriting another installation. Do not globally reload unrelated extensions
@@ -56,12 +56,17 @@ afterward. An already queued, unstarted bridge message is cancelled if it can
 still be identified. A running agent turn is never aborted by this extension.
 An idle checkpoint is best-effort, not a guarantee against context loss.
 
-`source: system`, `mode: enqueue` starts a normal visible agent turn; normal
+`source: system`, `mode: enqueue` starts a normal agent turn; normal
 model/tool costs and permission behavior still apply. The agent invokes the
 existing skill if useful and may decline to write. The prompt preserves
 `thread_id: copilot:<sessionId>` and available native repository context.
 It does not impose a new Basic Memory project-routing policy.
-The timeline labels each automatic request as a Basic Memory checkpoint.
+Some CLI versions hide system-origin prompts even when `displayPrompt` is set.
+The extension therefore emits one attributed timeline notice using `session.log`:
+`[basic-memory-bridge] Memory checkpoint queued`, after SDK acceptance.
+Started/finished/cancelled transitions update the status line without additional
+routine notices. The notice describes the checkpoint turn, not a verified note
+write. All extension timeline warnings also use this prefix; notice failures fail open.
 Reservations are not counted as opportunities until the SDK accepts the send.
 One-shot `-p` mode can terminate during idle follow-up delivery; it is not a
 substitute for testing a long-running interactive session.
@@ -88,6 +93,36 @@ decision codes. Repeated identical decisions are limited to once per minute;
 each session log stops growing at 1 MiB. No prompts, transcript contents,
 tool results, paths, or exception text are logged. Errors produce a bounded
 timeline warning. Set `enabled: false` to stop new automatic opportunities.
+
+## Status-line contribution
+
+The bridge publishes a bounded local snapshot at
+`%USERPROFILE%\.copilot\statusline\contributions\<sessionId>\basic-memory-bridge.json`.
+This is a generic display contract, separate from internal capture state.
+It contains an active label or token/time hint, color, priority, and expiry,
+without prompts, tool contents, paths, or error text. Atomic publication and a
+30-second lease, renewed every ten seconds, prevent stale activity after a
+process exits; a superseded process cannot clear the newer owner's signal.
+
+The optional compositor reads generic contributions for its own session ID,
+without importing BM code or parsing the bridge's state schema. Compaction warnings
+remain inside the colored percentage parentheses; checkpoint information stays
+separate at every utilization level. The last/next prefix is white, and only
+the active `queued`/`in progress` suffix is yellow. Idle hints use the
+earliest remaining token threshold alongside the last checkpoint's token position,
+then a countdown once tokens qualify. The token target returns after the cooldown,
+not a "next checkpoint now" label. Last checkpoint history survives context
+rebasing/compaction and advances only when an accepted turn settles, not when
+it is merely accepted and not as proof of a saved note. Forecasts use the native
+`contextInfo.compactionThreshold` as a planning boundary, or the native context
+limit when that optional metadata is unavailable. Targets not yet reached at or
+beyond the boundary yield `compaction expected first`; crossing that boundary
+while cooldown remains does the same. This is a background-start threshold, not
+a hard maximum. Compaction still recalculates normal eligibility, not an immediate
+recovery capture.
+A pressure offer resets periodic time and the post-checkpoint token watermark,
+as in the original gate. Expired/invalid/disabled contributions are ignored.
+See [the status-line guide](STATUSLINE.md) for the independent render contract.
 
 ## Logic tests
 

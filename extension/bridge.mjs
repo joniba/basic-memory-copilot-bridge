@@ -36,7 +36,8 @@ export function freshState(sessionId) {
   if (!sessionIdValid(sessionId)) throw new Error('session-invalid');
   return {
     version: 1, sessionId, baselineTokens: null, lastContextTokens: null, tokenLimit: null,
-    lastOpportunityTokens: null, lastOpportunityAt: null, lastSeenMessagesLength: 0,
+    lastOpportunityTokens: null, lastOpportunityAt: null, lastCheckpointTokens: null, lastCheckpointAt: null,
+    lastSeenMessagesLength: 0,
     compactionEpoch: 0, nativeCompactionCount: null, lastCompactionEventId: null, pressureOpportunityEpoch: null,
     pressurePending: false, compacting: false, captureInFlight: null, retryAfter: null,
   };
@@ -46,7 +47,8 @@ function validState(state, sessionId) {
   const flight = state?.captureInFlight;
   return object(state) && state.version === 1 && state.sessionId === sessionId
     && ['baselineTokens', 'lastContextTokens', 'tokenLimit', 'lastOpportunityTokens',
-      'lastOpportunityAt', 'pressureOpportunityEpoch', 'nativeCompactionCount', 'retryAfter'].every(key => optionalCount(state[key]))
+      'lastOpportunityAt', 'lastCheckpointTokens', 'lastCheckpointAt', 'pressureOpportunityEpoch',
+      'nativeCompactionCount', 'retryAfter'].every(key => optionalCount(state[key]))
     && count(state.lastSeenMessagesLength) && count(state.compactionEpoch)
     && typeof state.pressurePending === 'boolean' && typeof state.compacting === 'boolean'
     && (state.lastCompactionEventId === null || typeof state.lastCompactionEventId === 'string')
@@ -77,6 +79,14 @@ export class FileStateStore {
         const info = await stat(this.path);
         if (info.size > 16384) throw new Error('state-invalid');
         state = JSON.parse(await readFile(this.path, 'utf8'));
+        if (object(state) && !Object.hasOwn(state, 'lastCheckpointTokens')) {
+          state.lastCheckpointTokens = state.lastOpportunityAt !== null && state.captureInFlight === null
+            ? state.lastOpportunityTokens ?? null : null;
+        }
+        if (object(state) && !Object.hasOwn(state, 'lastCheckpointAt')) {
+          state.lastCheckpointAt = state.captureInFlight === null || state.lastCheckpointTokens !== null
+            ? state.lastOpportunityAt ?? null : null;
+        }
         if (!validState(state, this.sessionId)) throw new Error('state-invalid');
         state = Object.fromEntries(Object.keys(freshState(this.sessionId)).map(key => [key, state[key]]));
         if (state.captureInFlight) {
@@ -86,7 +96,10 @@ export class FileStateStore {
       } catch (error) {
         if (error.code === 'ENOENT') {
           state = freshState(this.sessionId);
-          if (this.legacyDirectory) state.lastOpportunityAt = await legacyOpportunity(this.legacyDirectory, this.sessionId);
+          if (this.legacyDirectory) {
+            state.lastOpportunityAt = await legacyOpportunity(this.legacyDirectory, this.sessionId);
+            state.lastCheckpointAt = state.lastOpportunityAt;
+          }
         }
         else if (error instanceof SyntaxError || error.message === 'state-invalid') {
           state = freshState(this.sessionId);
@@ -176,6 +189,55 @@ export function eligibility(state, config, now) {
   return 'below-gate';
 }
 
+export function statusContribution(state, usage, config) {
+  if (!state || !config.enabled) return null;
+  const flight = state.captureInFlight;
+  const previous = state.lastCheckpointTokens === null
+    ? state.lastCheckpointAt === null ? 'none' : 'unknown'
+    : state.lastCheckpointTokens < 1000 ? String(state.lastCheckpointTokens)
+      : `${Math.round(state.lastCheckpointTokens / 1000)}K`;
+  const prefix = `last checkpoint: ${previous}, next checkpoint: `;
+  if (flight && (flight.messageId !== null || flight.started)) {
+    return {
+      kind: 'activity', priority: 100, color: 'yellow',
+      prefix, label: flight.started ? 'in progress' : 'queued',
+    };
+  }
+  if (state.compacting || flight || !usage || state.baselineTokens === null) return null;
+  const snapshot = structuredClone(state);
+  applyUsage(snapshot, usage, config);
+  const delay = state.retryAfter ?? 0;
+  const watermark = snapshot.lastOpportunityTokens ?? snapshot.baselineTokens;
+  const periodic = watermark + config.periodicMinimumNewTokens;
+  const targets = [];
+  if (count(periodic)) targets.push({
+    tokens: periodic,
+    notBefore: Math.max(delay, state.lastOpportunityAt === null ? 0
+      : state.lastOpportunityAt + config.minimumMinutesBetweenOpportunities * 60000),
+  });
+  if (state.pressureOpportunityEpoch !== state.compactionEpoch) {
+    const pressure = Math.max(Math.ceil(usage.tokenLimit * config.contextPressureThreshold),
+      snapshot.baselineTokens + (state.compactionEpoch > 0 ? 1 : 0));
+    if (count(pressure)) targets.push({
+      tokens: pressure,
+      notBefore: Math.max(delay, state.lastOpportunityAt === null ? 0
+        : state.lastOpportunityAt + config.pressureMinimumMinutesBetweenOpportunities * 60000),
+    });
+  }
+  if (!targets.length) return null;
+  return {
+    kind: 'hint', priority: 10, color: 'white', targets,
+    tokenCeiling: count(usage.compactionThreshold) && usage.compactionThreshold > 0
+      ? usage.compactionThreshold : usage.tokenLimit,
+    labels: {
+      tokens: `${prefix}{tokens}`,
+      time: `${prefix}in {minutes}m`,
+      ready: `${prefix}{tokens}`,
+      beyond: `${prefix}compaction expected first`,
+    },
+  };
+}
+
 export function checkpointPrompt(sessionId, context = {}) {
   const provenance = { thread_id: `copilot:${sessionId}`, copilot_session_id: sessionId, captured_from: 'github-copilot' };
   for (const [key, value] of [['cwd', context.cwd], ['repo', context.gitRoot], ['branch', context.branch]]) {
@@ -226,11 +288,13 @@ export function createLogger(directory, sessionId, clock = Date.now) {
 }
 
 export class CaptureBridge {
-  constructor({ session, store, config, log, clock = Date.now }) {
+  constructor({ session, store, config, log, status = async () => {}, clock = Date.now }) {
     this.session = session;
     this.store = store;
     this.readConfig = config;
     this.log = log;
+    this.status = status;
+    this.lastState = null;
     this.clock = clock;
     this.queue = Promise.resolve();
     this.usage = null;
@@ -257,12 +321,42 @@ export class CaptureBridge {
       await this.report('bridge', `${stage}-error`);
       if (this.lastWarningAt === null || now - this.lastWarningAt >= 60000) {
         this.lastWarningAt = now;
-        await bounded(this.session.log(`Basic Memory bridge: ${stage} failed; normal session use continues.`, { level: 'warning' }));
+        await bounded(this.session.log(`[basic-memory-bridge] ${stage} failed; normal session use continues.`, { level: 'warning' }));
       }
+      if (stage !== 'notice' && stage !== 'status') await this.status(null);
     } catch {
       // Last-resort diagnostic contains no SDK errors, paths, or event payloads.
       console.error('{"event":"bridge","gateDecision":"diagnostic-error"}');
     }
+  }
+
+  async notice(message) {
+    try {
+      await bounded(this.session.log(`[basic-memory-bridge] ${message}`, { level: 'info' }));
+    } catch {
+      await this.warn('notice');
+    }
+  }
+
+  async publishStatus(config) {
+    try {
+      await this.status(this.stopped ? null
+        : statusContribution(this.lastState, this.usage, config));
+    } catch {
+      await this.warn('status');
+    }
+  }
+
+  async transaction(action) {
+    let snapshot;
+    const result = await this.store.transaction(async (state, recovered) => {
+      const result = await action(state, recovered);
+      snapshot = structuredClone(state);
+      return result;
+    });
+    this.lastState = snapshot;
+    await this.publishStatus(await this.readConfig());
+    return result;
   }
 
   enqueue(action) {
@@ -285,7 +379,7 @@ export class CaptureBridge {
     await this.refreshUsage();
     const attribution = await bounded(this.session.rpc.metadata.getContextAttribution());
     const compactions = attribution.contextAttribution?.compactions?.count;
-    await this.store.transaction(async (state, recovered) => {
+    await this.transaction(async (state, recovered) => {
       if (count(compactions)) {
         if (state.nativeCompactionCount !== null && state.nativeCompactionCount !== compactions) {
           state.compactionEpoch += Math.max(1, compactions - state.nativeCompactionCount);
@@ -299,6 +393,11 @@ export class CaptureBridge {
       state.compacting = false;
       if (this.usage) applyUsage(state, this.usage, await this.readConfig());
       if (recovered) await this.report('startup', 'state-recovered');
+      if (state.captureInFlight) {
+        const pending = await this.pendingFlight(state.captureInFlight);
+        const activity = await bounded(this.session.rpc.metadata.activity());
+        if (!pending && !activity.hasActiveWork) await this.finish(state, 'in-flight-reconciled');
+      }
     });
     this.ready = true;
     await this.report('startup', 'attached');
@@ -318,6 +417,8 @@ export class CaptureBridge {
     if (!count(info.totalTokens) || !count(info.limit) || info.limit === 0) throw new Error('usage-invalid');
     this.usage = {
       currentTokens: info.totalTokens, tokenLimit: info.limit,
+      ...(count(info.compactionThreshold) && info.compactionThreshold > 0
+        ? { compactionThreshold: info.compactionThreshold } : {}),
       ...(this.lastMessagesLength === undefined ? {} : { messagesLength: this.lastMessagesLength }),
     };
   }
@@ -338,6 +439,8 @@ export class CaptureBridge {
       return;
     }
     state.lastOpportunityTokens = state.lastContextTokens;
+    if (state.lastContextTokens !== null) state.lastCheckpointTokens = state.lastContextTokens;
+    state.lastCheckpointAt = this.clock();
     if (state.lastContextTokens !== null) state.baselineTokens = state.lastContextTokens;
     await this.report('session.idle', decision);
   }
@@ -357,6 +460,10 @@ export class CaptureBridge {
       if (!this.ready || this.stopped) return;
     }
     const config = await this.readConfig();
+    if (event.type === 'session.error') {
+      await this.warn('session');
+      return;
+    }
     if (event.type === 'session.context_changed') {
       this.context = { cwd: event.data.cwd, gitRoot: event.data.gitRoot, branch: event.data.branch };
       return;
@@ -367,19 +474,23 @@ export class CaptureBridge {
         await this.warn('usage');
       } else {
         if (count(event.data.messagesLength)) this.lastMessagesLength = event.data.messagesLength;
+        const compactionThreshold = this.usage?.tokenLimit === event.data.tokenLimit
+          ? this.usage.compactionThreshold : undefined;
         this.usage = {
           currentTokens: event.data.currentTokens, tokenLimit: event.data.tokenLimit,
+          ...(compactionThreshold === undefined ? {} : { compactionThreshold }),
           ...(this.lastMessagesLength === undefined ? {} : { messagesLength: this.lastMessagesLength }),
         };
         await this.report(event.type, 'usage-observed', config);
+        await this.publishStatus(config);
       }
       return;
     }
     if (event.type === 'session.shutdown') {
-      await this.store.transaction(state => {
+      this.stopped = true;
+      await this.transaction(state => {
         if (this.usage && !state.compacting) applyUsage(state, this.usage, config);
       });
-      this.stopped = true;
       await this.report(event.type, 'shutdown', config);
       return;
     }
@@ -387,16 +498,19 @@ export class CaptureBridge {
       'session.compaction_complete', 'session.context_cleared'].includes(event.type)) return;
     if (event.type === 'session.idle') await this.refreshUsage();
     let offer;
-    await this.store.transaction(async (state, recovered) => {
+    await this.transaction(async (state, recovered) => {
       if (this.usage && !state.compacting) applyUsage(state, this.usage, config);
       if (event.type === 'user.message') {
         const flight = state.captureInFlight ?? this.lastRequest;
-        if (flight && typeof event.data.messageId === 'string'
+        const ownMessage = flight && typeof event.data.messageId === 'string'
           && (flight.messageId === event.data.messageId
-            || (event.data.source === 'system' && event.data.content === `Basic Memory checkpoint: ${flight.id}`))) {
+            || (event.data.source === 'system' && event.data.content === `Basic Memory checkpoint: ${flight.id}`));
+        if (ownMessage) {
           state.captureInFlight ??= { ...flight };
           this.acceptOffer(state, flight, event.data.messageId);
           state.captureInFlight.started = true;
+        } else if (state.captureInFlight?.started && ['idle', 'queued'].includes(event.data.delivery)) {
+          await this.finish(state, 'checkpoint-turn-finished');
         }
         return;
       }
@@ -438,7 +552,13 @@ export class CaptureBridge {
         return;
       }
       if (event.data.aborted === true) {
-        if (state.captureInFlight?.started) await this.finish(state, 'checkpoint-aborted');
+        if (state.captureInFlight) {
+          const pending = state.captureInFlight.started ? null : await this.pendingFlight(state.captureInFlight);
+          const activity = state.captureInFlight.started ? null : await bounded(this.session.rpc.metadata.activity());
+          if (state.captureInFlight.started || (!pending && !activity.hasActiveWork)) {
+            await this.finish(state, 'checkpoint-aborted');
+          }
+        }
         await this.report(event.type, 'aborted', config);
         return;
       }
@@ -479,11 +599,12 @@ export class CaptureBridge {
     });
     if (!offer) return;
     if (this.compactionStarting) {
-      await this.store.transaction(state => {
+      await this.transaction(state => {
         if (state.captureInFlight?.id === offer.id) {
           state.captureInFlight = null;
         }
       });
+      this.lastRequest = null;
       await this.report(event.type, 'missed-pre-compaction', config);
       return;
     }
@@ -495,20 +616,22 @@ export class CaptureBridge {
       }), 30000);
       if (typeof messageId !== 'string' || !messageId.length) throw new Error('message-id-invalid');
       accepted = true;
-      await this.store.transaction(state => this.acceptOffer(state, offer, messageId));
+      await this.transaction(state => this.acceptOffer(state, offer, messageId));
+      await this.notice('Memory checkpoint queued');
       await this.report(event.type, `offered:${offer.kind}`, config);
     } catch {
       if (accepted) {
         await this.warn('state');
         return;
       }
-      await this.store.transaction(state => {
+      await this.transaction(state => {
         if (state.captureInFlight?.id === offer.id) {
           state.captureInFlight = null;
           state.retryAfter = this.clock() + 60000;
         }
       });
       await this.warn('send');
+      await this.publishStatus(config);
     }
   }
 }

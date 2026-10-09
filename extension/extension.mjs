@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { joinSession } from '@github/copilot-sdk/extension';
 import { CaptureBridge, createLogger, FileStateStore, validateConfig } from './bridge.mjs';
+import { StatusPublisher } from './status-publisher.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const home = process.env.COPILOT_HOME || join(homedir(), '.copilot');
@@ -11,6 +12,7 @@ let session;
 try {
   session = await joinSession({ tools: [], hooks: {} });
   const stateRoot = join(home, 'extension-state', 'basic-memory-bridge');
+  const publisher = new StatusPublisher(join(home, 'statusline', 'contributions'), session.sessionId, 'basic-memory-bridge');
   const bridge = new CaptureBridge({
     session,
     store: new FileStateStore(join(stateRoot, 'sessions'), session.sessionId, {
@@ -18,13 +20,20 @@ try {
     }),
     config: async () => validateConfig(JSON.parse(await readFile(join(root, 'config.json'), 'utf8'))),
     log: createLogger(join(stateRoot, 'logs'), session.sessionId),
+    status: value => publisher.publish(value),
   });
   bridge.start();
   session.on(event => bridge.on(event));
+  for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => {
+    publisher.close().catch(() => console.error('{"event":"shutdown","gateDecision":"status-error"}'))
+      .finally(() => process.exit(0));
+  });
+  session.on('session.shutdown', () => publisher.close()
+    .catch(() => console.error('{"event":"shutdown","gateDecision":"status-error"}')));
 } catch {
   console.error('{"event":"startup","gateDecision":"connection-error"}');
   if (session) {
-    await session.log('Basic Memory bridge failed to attach; automatic capture is unavailable.', { level: 'warning' })
+    await session.log('[basic-memory-bridge] Failed to attach; automatic capture is unavailable.', { level: 'warning' })
       .catch(() => console.error('{"event":"startup","gateDecision":"diagnostic-error"}'));
   }
 }
