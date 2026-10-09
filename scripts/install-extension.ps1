@@ -11,7 +11,7 @@ $source = Join-Path $root 'extension'
 $destination = Join-Path $CopilotHome 'extensions\basic-memory-bridge'
 if (Test-Path -LiteralPath $destination) { throw 'Extension destination already exists; inspect it before updating.' }
 $null = New-Item -ItemType Directory -Path $destination
-foreach ($name in @('extension.mjs', 'bridge.mjs', 'config.json')) {
+foreach ($name in @('extension.mjs', 'bridge.mjs', 'status-publisher.mjs', 'config.json')) {
     [System.IO.File]::Copy((Join-Path $source $name), (Join-Path $destination $name), $false)
 }
 Write-Output "Installed native extension: $destination"

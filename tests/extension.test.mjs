@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
   applyUsage, CaptureBridge, checkpointPrompt, createLogger, defaults,
   eligibility, FileStateStore, freshState, validateConfig,
+  statusContribution,
 } from '../extension/bridge.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -22,6 +23,7 @@ async function fixture(overrides = {}, id = 'test-session') {
   const logs = [];
   const warnings = [];
   const removed = [];
+  const statuses = [];
   let config = validateConfig(overrides);
   let now = start;
   let info = { totalTokens: 1000, limit: 200000 };
@@ -45,11 +47,14 @@ async function fixture(overrides = {}, id = 'test-session') {
       },
     },
   };
-  const create = () => new CaptureBridge({ session, store, config: async () => config, log: async row => logs.push(row), clock: () => now });
+  const create = () => new CaptureBridge({
+    session, store, config: async () => config, log: async row => logs.push(row),
+    status: async value => statuses.push(value), clock: () => now,
+  });
   let bridge = create();
   await bridge.start();
   const f = {
-    directory, store, session, sent, logs, warnings, removed,
+    directory, store, session, sent, logs, warnings, removed, statuses,
     state: async () => JSON.parse(await readFile(store.path, 'utf8')),
     info: value => { info = value; },
     time: value => { now = value; },
@@ -63,6 +68,203 @@ async function fixture(overrides = {}, id = 'test-session') {
   };
   return f;
 }
+
+test('one attributed queued notice accompanies activity transitions without routine lifecycle chatter', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 51000, limit: 200000 });
+  await f.idle();
+  assert.equal(f.statuses.at(-1).label, 'queued');
+  assert.equal(f.statuses.at(-1).prefix, 'last checkpoint: none, next checkpoint: ');
+  assert.deepEqual(f.warnings.map(value => value.message), [
+    '[basic-memory-bridge] Memory checkpoint queued',
+  ]);
+  await f.event('user.message', { messageId: 'message-1' });
+  assert.equal(f.statuses.at(-1).label, 'in progress');
+  assert.equal(f.statuses.at(-1).prefix, 'last checkpoint: none, next checkpoint: ');
+  await f.event('user.message', { messageId: 'message-1' });
+  f.info({ totalTokens: 53000, limit: 200000 });
+  await f.idle();
+  assert.equal(f.statuses.at(-1).kind, 'hint');
+  assert.deepEqual(f.warnings.map(value => value.message), ['[basic-memory-bridge] Memory checkpoint queued']);
+  assert.equal((await f.state()).lastCheckpointTokens, 53000);
+  assert.equal(f.sent.length, 1);
+  assert.ok(!f.warnings.some(value => /saved/i.test(value.message)));
+});
+
+test('accepted pressure opportunity resets periodic hint time and post-checkpoint token watermark', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 130000, limit: 200000 });
+  await f.idle();
+  assert.equal((await f.state()).pressureOpportunityEpoch, 0);
+  await f.event('user.message', { messageId: 'message-1' });
+  f.info({ totalTokens: 132000, limit: 200000 });
+  await f.idle();
+  const hint = f.statuses.at(-1);
+  assert.equal(hint.targets.length, 1);
+  assert.equal(hint.targets[0].tokens, 182000);
+  assert.equal(hint.targets[0].notBefore, start + 3600000);
+  assert.equal((await f.state()).lastOpportunityTokens, 132000);
+});
+
+test('aborted checkpoint clears the active label and shows no recursion or success claim', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 51000, limit: 200000 });
+  await f.idle();
+  await f.event('user.message', { messageId: 'message-1' });
+  await f.idle(true);
+  assert.equal((await f.state()).captureInFlight, null);
+  assert.equal(f.statuses.at(-1).kind, 'hint');
+  assert.deepEqual(f.warnings.map(value => value.message), ['[basic-memory-bridge] Memory checkpoint queued']);
+  assert.equal(f.sent.length, 1);
+});
+
+test('aborted unstarted request clears when no longer queued but preserves a still-pending request', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 51000, limit: 200000 });
+  await f.idle();
+  f.pending([{ id: 'queued', messageId: 'message-1' }]);
+  await f.idle(true);
+  assert.notEqual((await f.state()).captureInFlight, null);
+  assert.equal(f.statuses.at(-1).label, 'queued');
+  f.pending([]);
+  await f.idle(true);
+  assert.equal((await f.state()).captureInFlight, null);
+  assert.equal(f.statuses.at(-1).kind, 'hint');
+});
+
+test('send failure clears activity and publishes an idle retry hint with attributed error', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 51000, limit: 200000 });
+  f.session.send = async () => { throw new Error('private send failure'); };
+  await f.idle();
+  assert.equal(f.statuses.at(-1).kind, 'hint');
+  assert.equal((await f.state()).captureInFlight, null);
+  assert.ok(f.warnings.every(value => value.message.startsWith('[basic-memory-bridge] ')));
+  assert.ok(!JSON.stringify(f.warnings).includes('private'));
+});
+
+test('timeline notice failure does not prevent the accepted opportunity or duplicate it', async () => {
+  const f = await fixture();
+  f.session.log = async () => { throw new Error('synthetic-private-log-error'); };
+  f.info({ totalTokens: 51000, limit: 200000 });
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  assert.notEqual((await f.state()).captureInFlight, null);
+  assert.equal(f.statuses.at(-1).label, 'queued');
+  assert.ok(!JSON.stringify(f.logs).includes('synthetic-private'));
+});
+
+test('status publishing failure fails open without blocking capture', async () => {
+  const f = await fixture();
+  const bridge = new CaptureBridge({
+    session: f.session, store: f.store, config: async () => defaults,
+    log: async record => f.logs.push(record),
+    status: async () => { throw new Error('private status failure'); }, clock: () => start,
+  });
+  await bridge.start();
+  f.session.rpc.metadata.contextInfo = async () => ({ contextInfo: { totalTokens: 51000, limit: 200000 } });
+  await bridge.on({ type: 'session.idle', data: {} });
+  assert.equal(f.sent.length, 1);
+  assert.ok(!JSON.stringify(f.logs).includes('private'));
+});
+
+test('compaction arriving during idle reservation cancels the unsent checkpoint without a notification', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 65000, limit: 100000 });
+  f.session.rpc.metadata.activity = async () => {
+    void f.event('session.compaction_start');
+    return { hasActiveWork: false };
+  };
+  await f.idle();
+  await f.event('session.compaction_complete', { success: true });
+  assert.equal(f.sent.length, 0);
+  assert.equal((await f.state()).captureInFlight, null);
+  assert.equal(f.warnings.length, 0);
+  assert.ok(f.logs.some(value => value.gateDecision === 'missed-pre-compaction'));
+});
+
+test('existing native state gains checkpoint history without resetting cadence or treating a startup baseline as a checkpoint', async () => {
+  const f = await fixture();
+  const state = await f.state();
+  delete state.lastCheckpointTokens;
+  delete state.lastCheckpointAt;
+  state.lastOpportunityAt = start;
+  state.lastOpportunityTokens = 123456;
+  await writeFile(f.store.path, JSON.stringify(state));
+  await f.reload();
+  assert.equal((await f.state()).lastCheckpointTokens, 123456);
+  assert.equal((await f.state()).lastOpportunityAt, start);
+  const untouched = await fixture();
+  const baseline = await untouched.state();
+  delete baseline.lastCheckpointTokens;
+  delete baseline.lastCheckpointAt;
+  baseline.lastOpportunityTokens = 1000;
+  await writeFile(untouched.store.path, JSON.stringify(baseline));
+  await untouched.reload();
+  assert.equal((await untouched.state()).lastCheckpointTokens, null);
+});
+
+test('active checkpoint retains the previous settled history until the new turn settles', async () => {
+  const f = await fixture();
+  await f.store.transaction(state => {
+    state.lastCheckpointTokens = 198000;
+    state.lastCheckpointAt = start - 3600000;
+  });
+  f.info({ totalTokens: 130000, limit: 200000 });
+  await f.idle();
+  assert.equal((await f.state()).lastCheckpointTokens, 198000);
+  assert.equal(f.statuses.at(-1).prefix, 'last checkpoint: 198K, next checkpoint: ');
+  assert.equal(f.statuses.at(-1).label, 'queued');
+  await f.event('user.message', { messageId: 'message-1' });
+  assert.equal(f.statuses.at(-1).prefix, 'last checkpoint: 198K, next checkpoint: ');
+  assert.equal(f.statuses.at(-1).label, 'in progress');
+  f.info({ totalTokens: 132000, limit: 200000 });
+  await f.idle();
+  assert.equal((await f.state()).lastCheckpointTokens, 132000);
+});
+
+test('forecast uses native compaction threshold and invalidates cached boundaries when the context tier changes', async () => {
+  const f = await fixture({ periodicMinimumNewTokens: 150000 });
+  f.info({ totalTokens: 51000, limit: 200000, compactionThreshold: 120000 });
+  await f.idle();
+  assert.equal(f.statuses.at(-1).tokenCeiling, 120000);
+  await f.event('session.usage_info', { currentTokens: 52000, tokenLimit: 200000 });
+  assert.equal(f.statuses.at(-1).tokenCeiling, 120000);
+  await f.event('session.usage_info', { currentTokens: 52000, tokenLimit: 500000 });
+  assert.equal(f.statuses.at(-1).tokenCeiling, 500000);
+  f.info({ totalTokens: 52000, limit: 500000, compactionThreshold: 300000 });
+  await f.idle();
+  assert.equal(f.statuses.at(-1).tokenCeiling, 300000);
+});
+
+test('last checkpoint history survives context rebasing, compaction, and reload', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 51000, limit: 200000 });
+  await f.idle();
+  await f.event('user.message', { messageId: 'message-1' });
+  f.info({ totalTokens: 53000, limit: 200000 });
+  await f.idle();
+  f.info({ totalTokens: 2000, limit: 200000 });
+  await f.idle();
+  assert.equal((await f.state()).lastOpportunityTokens, 2000);
+  assert.equal((await f.state()).lastCheckpointTokens, 53000);
+  await f.event('session.compaction_complete', { success: true });
+  f.info({ totalTokens: 1000, limit: 200000 });
+  await f.reload();
+  assert.equal((await f.state()).lastCheckpointTokens, 53000);
+});
+
+test('session error and shutdown clear status without falsely releasing in-flight safety', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 51000, limit: 200000 });
+  await f.idle();
+  await f.event('session.error', { message: 'private error text' });
+  assert.equal(f.statuses.at(-1), null);
+  assert.notEqual((await f.state()).captureInFlight, null);
+  await f.event('session.shutdown');
+  assert.equal(f.statuses.at(-1), null);
+  assert.ok(f.warnings.every(value => value.message.startsWith('[basic-memory-bridge] ')));
+});
 
 test('production config matches code defaults and native thresholds', async () => {
   assert.deepEqual(JSON.parse(await readFile(join(root, 'extension', 'config.json'), 'utf8')), defaults);
@@ -86,7 +288,11 @@ test('cutover imports only the previous offer time, not byte watermarks', async 
   await store.transaction(state => {
     assert.equal(state.lastOpportunityAt, start);
     assert.equal(state.lastOpportunityTokens, null);
+    assert.equal(state.lastCheckpointAt, start);
+    assert.equal(state.lastCheckpointTokens, null);
     applyUsage(state, { currentTokens: 1000, tokenLimit: 200000 }, defaults);
+    assert.equal(statusContribution(state, { currentTokens: 1000, tokenLimit: 200000 }, defaults).labels.tokens,
+      'last checkpoint: unknown, next checkpoint: {tokens}');
   });
   await store.transaction(state => {
     applyUsage(state, { currentTokens: 51000, tokenLimit: 200000 }, defaults);
@@ -299,7 +505,7 @@ test('high post-compaction context cannot replay a pressure checkpoint without n
   assert.equal(f.sent.length, 0);
   f.info({ totalTokens: 71000, limit: 100000 });
   await f.idle();
-  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent.length, 1, JSON.stringify({ state: await f.state(), logs: f.logs, notices: f.warnings }));
 });
 
 test('queued user work prevents an idle checkpoint', async () => {
@@ -362,9 +568,35 @@ test('reload reconciles completed request and preserves cooldown and watermark',
   await f.idle();
   assert.equal(f.sent.length, 1);
   assert.equal((await f.state()).captureInFlight, null);
-  assert.equal((await f.state()).lastOpportunityTokens, 60000);
+  assert.equal((await f.state()).lastOpportunityTokens, 51000);
   await f.idle();
   assert.equal(f.sent.length, 1);
+});
+
+test('reload immediately clears detached stale progress, but preserves a still-running checkpoint', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 51000, limit: 200000 });
+  await f.idle();
+  await f.event('user.message', { messageId: 'message-1' });
+  f.active(true);
+  await f.reload();
+  assert.equal(f.statuses.at(-1).label, 'in progress');
+  f.active(false);
+  await f.reload();
+  assert.equal(f.statuses.at(-1).kind, 'hint');
+  assert.equal((await f.state()).captureInFlight, null);
+});
+
+test('another consumed logical turn clears old progress, while immediate steering does not', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 51000, limit: 200000 });
+  await f.idle();
+  await f.event('user.message', { messageId: 'message-1' });
+  await f.event('user.message', { messageId: 'human-steer', delivery: 'steering' });
+  assert.equal(f.statuses.at(-1).label, 'in progress');
+  await f.event('user.message', { messageId: 'new-turn', delivery: 'idle' });
+  assert.equal(f.statuses.at(-1).kind, 'hint');
+  assert.equal((await f.state()).captureInFlight, null);
 });
 
 test('reload observes compaction missed while detached and resets epoch', async () => {

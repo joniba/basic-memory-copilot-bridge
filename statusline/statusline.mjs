@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { contributionLabel, readContributions, validContribution } from './contributions.mjs';
 
 const script = fileURLToPath(import.meta.url);
 const configPath = join(dirname(script), 'config.json');
@@ -10,16 +11,27 @@ const object = value => value !== null && typeof value === 'object' && !Array.is
 const count = value => Number.isSafeInteger(value) && value >= 0;
 const diagnostic = code => process.stderr.write(`context-token-statusline: ${code}\n`);
 
-export function tokenBadge(status) {
+const paint = (text, color) => `${{ white: '\u001b[37m', yellow: '\u001b[33m', red: '\u001b[31m' }[color]}${text}\u001b[39m`;
+const paintLabel = label => `${label.prefix ? paint(label.prefix, 'white') : ''}${paint(label.text, label.color)}`;
+
+export function tokenBadge(status, contributions = [], now = Date.now()) {
+  const candidates = contributions.filter(validContribution).sort((a, b) => b.priority - a.priority);
+  const activity = candidates.find(value => value.kind === 'activity');
+  const activeLabel = activity ? contributionLabel(activity, null, now) : null;
   const context = status?.context_window;
   if (!object(context) || !count(context.current_context_tokens)
-    || !count(context.displayed_context_limit) || context.displayed_context_limit === 0) return '';
+    || !count(context.displayed_context_limit) || context.displayed_context_limit === 0) {
+    return activeLabel ? paintLabel(activeLabel) : '';
+  }
   const tokens = context.current_context_tokens;
   const percentage = Math.round(tokens / context.displayed_context_limit * 100);
   const amount = tokens < 1000 ? String(tokens) : `${Math.round(tokens / 1000)}K`;
-  const color = percentage >= 70 ? '\u001b[31m' : percentage >= 60 ? '\u001b[33m' : '';
-  const warning = percentage >= 70 ? ' - compaction imminent' : percentage >= 60 ? ' - nearing compaction' : '';
-  return `tokens: ${amount} (${color}${percentage}%${warning}${color ? '\u001b[39m' : ''})`;
+  const color = percentage >= 70 ? 'red' : percentage >= 60 ? 'yellow' : 'white';
+  const hint = candidates.find(value => value.kind === 'hint');
+  const warning = percentage >= 70 ? 'compaction imminent' : percentage >= 60 ? 'nearing compaction' : null;
+  const utilization = `${percentage}%${warning ? ` \u2014 ${warning}` : ''}`;
+  const label = activeLabel ?? (hint ? contributionLabel(hint, tokens, now) : null);
+  return `tokens: ${amount} (${paint(utilization, color)})${label ? ` ${paintLabel(label)}` : ''}`;
 }
 
 export function compose(previous, badge) {
@@ -76,7 +88,7 @@ export function renderStatusLine(input, config, options) {
     (options?.warn || diagnostic)('input-invalid');
   }
   const previous = renderPrevious(config.previousStatusLine?.command, input, status, options);
-  return compose(previous, config.showTokens ? tokenBadge(status) : '');
+  return compose(previous, config.showTokens ? tokenBadge(status, options?.contributions, options?.now) : '');
 }
 
 async function main() {
@@ -99,7 +111,15 @@ async function main() {
     return;
   }
   try {
-    process.stdout.write(renderStatusLine(input, config));
+    let contributions = [];
+    try {
+      const status = JSON.parse(input);
+      const home = process.env.COPILOT_HOME || join(homedir(), '.copilot');
+      contributions = await readContributions(join(home, 'statusline', 'contributions'), status?.session_id, { warn: diagnostic });
+    } catch {
+      diagnostic('contribution-input-invalid');
+    }
+    process.stdout.write(renderStatusLine(input, config, { contributions }));
   } catch {
     diagnostic('render-error');
   }

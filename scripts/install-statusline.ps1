@@ -17,6 +17,36 @@ using System.Text.Json;
 
 public static class TokenStatusLineSettings
 {
+    public static string AddRefreshInterval(string text)
+    {
+        var bytes = Encoding.UTF8.GetBytes(text);
+        var reader = new Utf8JsonReader(bytes, new JsonReaderOptions {
+            CommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true
+        });
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.PropertyName && reader.CurrentDepth == 1
+                && reader.ValueTextEquals("statusLine"))
+            {
+                reader.Read();
+                long start = reader.BytesConsumed;
+                while (reader.Read())
+                {
+                    if (reader.TokenType == JsonTokenType.EndObject && reader.CurrentDepth == 1) break;
+                    if (reader.TokenType == JsonTokenType.PropertyName && reader.CurrentDepth == 2
+                        && reader.ValueTextEquals("refreshInterval"))
+                    {
+                        reader.Read();
+                        return reader.TokenType == JsonTokenType.Null
+                            ? Replace(bytes, reader.TokenStartIndex, reader.BytesConsumed, "2") : text;
+                    }
+                }
+                return Replace(bytes, start, start, "\"refreshInterval\":2,");
+            }
+        }
+        throw new InvalidOperationException("statusLine group missing.");
+    }
+
     public static string Patch(string text, string command)
     {
         var options = new JsonDocumentOptions { CommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true };
@@ -91,8 +121,12 @@ try {
     $node = (Get-Command node -CommandType Application -ErrorAction Stop).Source
     $command = '"{0}" "{1}"' -f $node, (Join-Path $destination 'statusline.mjs')
     $patched = [TokenStatusLineSettings]::Patch($original, $command)
+    if ($null -eq ($patched | ConvertFrom-Json).statusLine.refreshInterval) {
+        $patched = [TokenStatusLineSettings]::AddRefreshInterval($patched)
+    }
     $null = New-Item -ItemType Directory -Path $destination
     [System.IO.File]::Copy((Join-Path $root 'statusline\statusline.mjs'), (Join-Path $destination 'statusline.mjs'), $false)
+    [System.IO.File]::Copy((Join-Path $root 'statusline\contributions.mjs'), (Join-Path $destination 'contributions.mjs'), $false)
     $config = @{ previousStatusLine = $previous; showTokens = $true } | ConvertTo-Json -Depth 10
     [System.IO.File]::WriteAllText((Join-Path $destination 'config.json'), $config)
     if ((Test-Path -LiteralPath $settingsPath) -ne $settingsExisted -or
@@ -105,7 +139,7 @@ try {
         throw 'Status-line command verification failed; files retained. Inspect settings before retrying.'
     }
     Write-Output "Installed token status-line compositor: $destination"
-    Write-Output 'Previous renderer saved in config.json; other status-line settings are unchanged.'
+    Write-Output 'Previous renderer saved; existing padding/refresh preserved, with a 2-second refresh when unset.'
 } finally {
     $env:COPILOT_HOME = $oldHome
 }

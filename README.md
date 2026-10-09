@@ -40,7 +40,7 @@ checkout; cloning is not required. From the extracted repository directory:
 copilot --experimental
 ```
 
-The installer copies the three runtime files under `extension\` to
+The installer copies the four runtime files under `extension\` to
 `%USERPROFILE%\.copilot\extensions\basic-memory-bridge` (or `COPILOT_HOME`).
 The SDK is supplied by Copilot; no package installation is needed. Checking
 out this repository alone does not activate the extension.
@@ -87,7 +87,7 @@ additional installer once:
 It preserves the existing custom renderer and appends the labeled badge:
 
 ```text
-[existing status] | tokens: 205K (81% - compaction imminent)
+[existing status] | tokens: 205K (81% — compaction imminent)
 ```
 
 Without a previous renderer, the output contains only the token badge.
@@ -97,12 +97,48 @@ code. Extension load order does not affect composition.
 Once configured, **Copilot runs the script automatically on status-line
 refreshes**. It uses the current native context-token count and selected
 context tier's limit, not billed tokens or BM capture state. Missing token
-data hides only the badge. No polling, MCP requests, or model calls are added.
-The percentage and warning are yellow at **60-69%** (`60% - nearing compaction`)
-and red at **70% or more** (`71% - compaction imminent`). Below 60%, the
-percentage is uncolored and has no warning. Colors and labels follow the
-displayed rounded percentage; the red label is an early warning, not a
-guarantee of the CLI's actual compaction timing.
+data hides the token count rather than inventing usage. No MCP requests or
+model calls are added. Compaction and checkpoint information are independent:
+
+| State | Inside parentheses | Checkpoint information outside parentheses |
+| --- | --- | --- |
+| Below 60% | White percentage | White `last checkpoint: 455K, next checkpoint: 505K`, when valid bridge data is available |
+| 60-69% | Yellow percentage and `— nearing compaction` | White last/next checkpoint information remains visible |
+| 70%+ | Red percentage and `— compaction imminent` | White last/next checkpoint information remains visible |
+| Checkpoint queued or started | Normal utilization warning, still visible | White last/next prefix, with only `queued` or `in progress` yellow |
+
+The em dash belongs inside the percentage parentheses. Checkpoint information
+follows the closing parenthesis with a space. Active status replaces only the
+next-checkpoint forecast, not the compaction warning or previous checkpoint:
+`last checkpoint: 455K, next checkpoint: in progress`.
+The next target is the earliest remaining periodic or pressure token trigger.
+Once its tokens qualify but its cooldown remains, the label becomes
+`last checkpoint: 455K, next checkpoint: in 12m`. Once the cooldown expires,
+the token target returns until a checkpoint is actually accepted; there is
+no "next checkpoint now" label. Last checkpoint means the native context-token
+position of the last settled accepted checkpoint turn, not a verified note write.
+It does not advance while a new turn is merely queued or running, and survives
+compaction separately from eligibility
+watermarks. Before any checkpoint it is `none`; an imported opportunity without
+a known token position is `unknown`. When remaining token targets lie at or beyond
+the native background-compaction boundary, the forecast says
+`next checkpoint: compaction expected first`, rather than advertising a target
+that is unlikely to be reached. The same applies if that boundary is already
+crossed while cooldown remains. This boundary comes from native context metadata,
+not the 60/70% display colors; if unavailable, the native context limit is used.
+Background compaction is asynchronous, so this is an expectation, not a hard cap
+or a promise of immediate capture afterward. Normal eligibility is recalculated
+after compaction without changing capture gates.
+
+The bridge emits one normal timeline notice per accepted request:
+`[basic-memory-bridge] Memory checkpoint queued`.
+A system-origin checkpoint prompt itself may be hidden by the CLI despite
+`displayPrompt`; this notice explains the resulting activity. Queued/start/clear
+status transitions remain in the status line without requested, started, finished,
+or routine cancellation chatter. Warnings retain the extension prefix.
+Neither the queued notice nor an in-progress label proves a note was saved.
+Colors follow displayed rounded utilization, and compaction labels are
+early warnings rather than guarantees of actual scheduler timing.
 
 ### Already-open CLI sessions
 
@@ -123,8 +159,11 @@ The companion is installed under
 `%USERPROFILE%\.copilot\statusline\context-tokens` (or `COPILOT_HOME`), separately
 from the BM extension. Its `config.json` saves the previous renderer and has
 `showTokens: true`; set that to `false` to keep only the previous output.
-The installer preserves unrelated settings, padding, and refresh interval,
-and refuses an existing installation rather than overwriting or nesting it.
+The installer preserves unrelated settings, padding, and an existing refresh
+interval; when no interval is set, it adds a two-second status-line refresh.
+This updates countdowns and expires stale activity without extra model calls.
+The installer refuses an existing installation rather than overwriting or
+nesting it.
 
 See [the status-line guide](STATUSLINE.md) for restoration, formatting, and
 failure behavior. This optional component does not change automatic capture.
