@@ -1,6 +1,6 @@
 # Basic Memory Copilot bridge
 
-A Windows-only native Copilot CLI extension that offers intelligent memory
+A native Copilot CLI extension, validated on Windows, that offers intelligent memory
 checkpoints in the user's existing interactive session. The upstream Basic
 Memory `memory-capture` skill performs any actual writing. The extension
 uses native context information, not transcript bytes, and adds no shell
@@ -8,7 +8,8 @@ hooks, plugin manifest, custom MCP server, bundled skill, or model client.
 
 ## Requirements
 
-- Node.js (tested with 24.16.0), PowerShell 7, and GitHub Copilot CLI.
+- Node.js 20 or newer (tested with 24.16.0), Git, and GitHub Copilot CLI.
+- PowerShell 7 only when using the legacy PowerShell installation commands.
 - A working **local** Basic Memory MCP server available to Copilot.
 - The upstream Basic Memory `memory-capture` skill installed and enabled.
 - Experimental Copilot CLI extensions enabled with `--experimental`.
@@ -30,29 +31,91 @@ Copilot to verify that the MCP actually responds and the destination project
 uses local mode. Listing a configured server alone does not establish health.
 The bridge does not install, replace, or reconfigure your MCP server or skill.
 
-## Install or try locally
+## Install or update with npx
 
-Download this revision as a ZIP from GitHub and extract it, or use an existing
-checkout; cloning is not required. From the extracted repository directory:
+From a published revision, install or update in one command without maintaining
+a source checkout:
+
+```powershell
+npx github:joniba/basic-memory-copilot-bridge --update
+```
+
+The package has an npm executable entry and a strict asset allowlist. npm may
+ask permission to fetch the GitHub package. `--update` separately authorizes
+replacement of this project's managed runtime files and status-line wiring;
+without it, identical installs are a no-op and changed existing files are refused.
+Changed originals are backed up under
+`<CopilotHome>\installation-backups\basic-memory-bridge`.
+An exclusive installation lock prevents competing installer writes; a leftover
+lock requires owner inspection, not automatic removal.
+
+The default npx command installs **both** the native extension and composing
+status-line companion. It preserves existing capture config, saved renderer
+preferences, checkpoint state, MCP configuration, skills and unrelated settings.
+Code is replaced atomically without purging unknown files. The executable and
+renderer paths point into the persistent Copilot home, not npm's temporary cache.
+The installer does not launch Copilot, reload extensions, or configure Basic Memory.
+Native runtime code remains dependency-free apart from the SDK supplied by Copilot;
+the installer alone uses a JSONC parser.
+
+```powershell
+# Native extension only; an existing companion is left untouched:
+npx github:joniba/basic-memory-copilot-bridge --update --no-statusline
+
+# Independent token/status companion only:
+npx github:joniba/basic-memory-copilot-bridge --update --statusline-only
+```
+
+Use `--copilot-home` with an absolute path to select another destination;
+otherwise `COPILOT_HOME`, then the user's `.copilot` directory, is used.
+The installer refuses symlinked managed paths and ambiguous existing compositor
+wiring rather than risking a recursive wrapper or overwriting another location.
+It never logs the saved previous command.
+
+### Share a feature branch or pinned revision
+
+npm Git selectors make published in-progress features installable without a clone:
+
+```powershell
+npx "github:joniba/basic-memory-copilot-bridge#feature/npx-installation" --update
+```
+
+For reproducible testing, prefer an exact published commit over a moving branch:
+
+```powershell
+$repo = 'github:joniba/basic-memory-copilot-bridge'
+$revision = '<full-commit-sha>'
+npx "$repo#$revision" --update
+```
+
+Only published refs can be fetched from GitHub. npm can cache Git package
+resolutions, so pin the requested commit when exchanging a specific candidate.
+This package is distributed from GitHub, not published to the npm registry.
+
+### From a checkout or extracted ZIP
+
+```powershell
+npm install --ignore-scripts
+node .\scripts\install.mjs --update
+```
+
+The original dependency-free PowerShell commands remain **create-only**:
 
 ```powershell
 .\scripts\install-extension.ps1
-copilot --experimental
+.\scripts\install-statusline.ps1
 ```
 
-The installer copies the four runtime files under `extension\` to
-`%USERPROFILE%\.copilot\extensions\basic-memory-bridge` (or `COPILOT_HOME`).
-The SDK is supplied by Copilot; no package installation is needed. Checking
-out this repository alone does not activate the extension.
-
-**The token status line is optional and is not installed by
-`install-extension.ps1`.** To add it, follow
-[Optional token status line](#optional-token-status-line) below.
+Those commands still refuse an existing destination. The native-only PowerShell
+command does not install the optional companion; use npx or the Node installer
+for safe in-place updates. Checking out source alone does not activate it.
+For component locations, see [the native guide](NATIVE-EXTENSION.md) and
+[the status-line guide](STATUSLINE.md).
 
 If migrating from `basic-memory-copilot`, close affected CLI sessions, disable
 and uninstall that old plugin first, then install the extension and start a
 fresh CLI. The installer refuses an enabled old plugin or an existing target
-directory rather than silently overwriting it. Do not reinstall the old plugin,
+directory in create-only mode rather than silently overwriting it. Do not reinstall the old plugin,
 mount an old revision with `--plugin-dir`, or globally reload unrelated
 extensions as an activation shortcut.
 
@@ -77,11 +140,11 @@ logging are enabled by default. Set `enabled: false` to stop new automatic offer
 
 The token display is a **separate status-line script**, not part of the
 long-running BM extension. Installing or reloading that extension does not
-enable the display. From the extracted repository directory, run this
-additional installer once:
+enable the display. The default npx installer handles both independently; a
+native-only install does not enable the companion. To install/update it separately:
 
 ```powershell
-.\scripts\install-statusline.ps1
+npx github:joniba/basic-memory-copilot-bridge --update --statusline-only
 ```
 
 It preserves the existing custom renderer and appends the labeled badge:
@@ -162,11 +225,25 @@ from the BM extension. Its `config.json` saves the previous renderer and has
 The installer preserves unrelated settings, padding, and an existing refresh
 interval; when no interval is set, it adds a two-second status-line refresh.
 This updates countdowns and expires stale activity without extra model calls.
-The installer refuses an existing installation rather than overwriting or
-nesting it.
+Updates recognize their own installed command and retain the saved original
+renderer instead of wrapping the compositor again. If another installer has
+changed the active renderer, an authorized update composes that current renderer
+and preserves `showTokens`. Missing or recursive saved config is rejected.
+The legacy PowerShell command remains create-only.
 
 See [the status-line guide](STATUSLINE.md) for restoration, formatting, and
 failure behavior. This optional component does not change automatic capture.
+
+### State-file preservation versus runtime reconciliation
+
+The updater leaves checkpoint state files byte-identical and never reloads a
+running session automatically. The native bridge separately reconciles context
+when it is attached/reloaded. Its existing policy rebases periodic watermarks
+when a native token total decreases, even if the successful compaction count is
+unchanged. That can discard accrued periodic growth and move the displayed
+target; retaining state files is not a guarantee of an identical forecast after
+reload. This packaging change does not alter that runtime policy or the capture
+thresholds. Opportunity timestamps and actual epoch/reset rules remain intact.
 
 ## Capture identity and privacy
 

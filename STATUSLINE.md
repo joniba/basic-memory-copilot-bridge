@@ -15,21 +15,33 @@ Installing the BM extension alone does not install or enable this companion.
 
 ## Install
 
-From an extracted revision or existing checkout:
+Install/update the standalone companion from a published revision:
 
 ```powershell
-.\scripts\install-statusline.ps1
+npx github:joniba/basic-memory-copilot-bridge --update --statusline-only
 ```
 
-The installer surgically edits only `statusLine.command` in user settings,
+The default npx command installs both this companion and the native bridge;
+`--no-statusline` skips this component without disabling an existing install.
+From a checkout, restore installer dependencies with `npm install --ignore-scripts`
+and run `node .\scripts\install.mjs --update --statusline-only`. The original
+`scripts\install-statusline.ps1` remains a dependency-free, create-only alternative.
+
+The installer surgically edits `statusLine.command` in user settings,
 preserving unrelated settings (including JSONC comments), padding, and any
 existing refresh interval. When unset, it adds a two-second CLI refresh so
 countdowns update and expired signals disappear. It refuses settings changed
 while installation is in progress. It
 installs under `%USERPROFILE%\.copilot\statusline\context-tokens`, honoring
 `COPILOT_HOME`, and saves the original status-line configuration in its own
-`config.json`. It refuses an existing destination rather than overwriting or
-nesting another compositor. It does not modify the original renderer.
+`config.json`. Managed file replacement requires `--update`; changed originals
+are backed up and unknown files are not purged. An update recognizes its own
+command and keeps its saved renderer config byte-identical, rather than nesting
+another compositor. It preserves `showTokens`, padding and explicit refresh;
+if another installer changed the active renderer, the newly selected renderer
+is composed. Missing, recursive or ambiguous saved wiring fails before changes.
+The original renderer's code is never modified. npx's cache is not used as the
+installed runtime location.
 
 After installation, Copilot invokes the script automatically on status-line
 refreshes. In an already-open session, run `/settings statusLine.padding 0`
