@@ -118,8 +118,10 @@ remain inside the colored percentage parentheses; checkpoint information stays
 separate at every utilization level. The last/next prefix is white, and only
 the active `queued`/`in progress` suffix is yellow. Idle hints use the
 earliest remaining token threshold alongside the last checkpoint's token position,
-then a countdown once tokens qualify. The token target returns after the cooldown,
-not a "next checkpoint now" label. Last checkpoint history survives context
+then a countdown once tokens qualify. After the cooldown, the white forecast
+shows `next checkpoint: awaiting idle`, not an already-passed token target or
+a "next checkpoint now" label. This is eligibility, not queue admission, and
+does not alter the safe-idle requirement. Last checkpoint history survives context
 rebasing/compaction and advances only when an accepted turn settles, not when
 it is merely accepted and not as proof of a saved note. Forecasts use the native
 `contextInfo.compactionThreshold` as a planning boundary, or the native context

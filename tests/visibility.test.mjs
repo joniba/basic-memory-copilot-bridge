@@ -45,7 +45,7 @@ test('pressure target wins when periodic threshold is farther away', () => {
   assert.equal(contributionLabel(hint, 630000, now).text, 'last checkpoint: none, next checkpoint: 650K');
 });
 
-test('reached target shows live cooldown countdown, then returns to the token target without due-now wording', () => {
+test('reached target shows live cooldown countdown, then awaits idle without claiming acceptance', () => {
   const state = stateAt();
   state.lastOpportunityAt = now - 48 * 60000;
   state.lastOpportunityTokens = 455000;
@@ -55,7 +55,8 @@ test('reached target shows live cooldown countdown, then returns to the token ta
   assert.equal(contributionLabel(hint, 505000, now).text, 'last checkpoint: 455K, next checkpoint: in 12m');
   assert.equal(contributionLabel(hint, 505000, now + 60000).text, 'last checkpoint: 455K, next checkpoint: in 11m');
   assert.equal(contributionLabel(hint, 505000, now + 12 * 60000 - 1).text, 'last checkpoint: 455K, next checkpoint: in 1m');
-  assert.equal(contributionLabel(hint, 505000, now + 12 * 60000).text, 'last checkpoint: 455K, next checkpoint: 505K');
+  assert.equal(contributionLabel(hint, 505000, now + 12 * 60000).text, 'last checkpoint: 455K, next checkpoint: awaiting idle');
+  assert.equal(contributionLabel(hint, 700000, now + 12 * 60000).text, 'last checkpoint: 455K, next checkpoint: awaiting idle');
 });
 
 test('both token triggers reached chooses the earlier cooldown', () => {
@@ -65,7 +66,7 @@ test('both token triggers reached chooses the earlier cooldown', () => {
   state.lastCheckpointTokens = 500000;
   const hint = statusContribution(state, usage(700000), defaults);
   assert.equal(contributionLabel(hint, 700000, now).text, 'last checkpoint: 500K, next checkpoint: in 5m');
-  assert.equal(contributionLabel(hint, 700000, now + 5 * 60000).text, 'last checkpoint: 500K, next checkpoint: 650K');
+  assert.equal(contributionLabel(hint, 700000, now + 5 * 60000).text, 'last checkpoint: 500K, next checkpoint: awaiting idle');
   state.pressureOpportunityEpoch = state.compactionEpoch;
   const consumed = statusContribution(state, usage(700000), defaults);
   assert.equal(consumed.targets.length, 1);
@@ -89,9 +90,9 @@ test('active checkpoint suffix alone is yellow while compaction warnings stay in
 test('checkpoint hints remain visible above 60 percent and active status only replaces the forecast', () => {
   const hint = statusContribution(stateAt(), usage(500000), defaults);
   assert.equal(tokenBadge(status(650000), [hint], now),
-    `tokens: 650K (${yellow('65% \u2014 nearing compaction')}) ${white('last checkpoint: none, next checkpoint: 505K')}`);
+    `tokens: 650K (${yellow('65% \u2014 nearing compaction')}) ${white('last checkpoint: none, next checkpoint: awaiting idle')}`);
   assert.equal(tokenBadge(status(790000), [hint], now),
-    `tokens: 790K (${red('79% \u2014 compaction imminent')}) ${white('last checkpoint: none, next checkpoint: 505K')}`);
+    `tokens: 790K (${red('79% \u2014 compaction imminent')}) ${white('last checkpoint: none, next checkpoint: awaiting idle')}`);
   assert.equal(tokenBadge(status(500000), [checkpointActivity('queued'), hint], now),
     `tokens: 500K (${white('50%')}) ${white('last checkpoint: 198K, next checkpoint: ')}${yellow('queued')}`);
   assert.equal(tokenBadge(status(500000), [hint], now),
@@ -187,7 +188,7 @@ test('future target at the native compaction boundary is not advertised as a pre
   state.pressureOpportunityEpoch = state.compactionEpoch;
   const hint = statusContribution(state, { ...usage(500000), compactionThreshold: 505000 }, defaults);
   assert.equal(contributionLabel(hint, 500000, now).text, 'last checkpoint: none, next checkpoint: compaction expected first');
-  assert.equal(contributionLabel(hint, 505000, now).text, 'last checkpoint: none, next checkpoint: 505K');
+  assert.equal(contributionLabel(hint, 505000, now).text, 'last checkpoint: none, next checkpoint: awaiting idle');
 });
 
 test('crossing the native boundary takes precedence over a future cooldown but not an already-eligible opportunity', () => {
@@ -198,7 +199,36 @@ test('crossing the native boundary takes precedence over a future cooldown but n
   state.lastCheckpointAt = now;
   const hint = statusContribution(state, { ...usage(505000), compactionThreshold: 500000 }, defaults);
   assert.equal(contributionLabel(hint, 505000, now).text, 'last checkpoint: 455K, next checkpoint: compaction expected first');
-  assert.equal(contributionLabel(hint, 505000, now + 60 * 60000).text, 'last checkpoint: 455K, next checkpoint: 505K');
+  assert.equal(contributionLabel(hint, 505000, now + 60 * 60000).text, 'last checkpoint: 455K, next checkpoint: awaiting idle');
+});
+
+test('the reported overdue first-checkpoint target displays awaiting idle in white, not queued', () => {
+  const state = stateAt(35506, 551000);
+  const nativeUsage = { currentTokens: 551000, tokenLimit: 922000, compactionThreshold: 737600 };
+  const hint = statusContribution(state, nativeUsage, defaults);
+  const native = { session_id: 'test-session', context_window: {
+    current_context_tokens: 551000, displayed_context_limit: 922000,
+  } };
+  assert.equal(hint.targets[0].tokens, 85506);
+  assert.equal(tokenBadge(native, [hint], now),
+    `tokens: 551K (${yellow('60% \u2014 nearing compaction')}) ${white('last checkpoint: none, next checkpoint: awaiting idle')}`);
+  assert.equal(state.lastOpportunityAt, null);
+  assert.equal(state.captureInFlight, null);
+});
+
+test('an overdue target after resume retains the historical checkpoint and does not change cadence', () => {
+  const state = stateAt(354228, 497518);
+  state.lastOpportunityAt = now - 7200000;
+  state.lastCheckpointAt = now - 7180000;
+  state.lastCheckpointTokens = 281313;
+  state.lastOpportunityTokens = 354228;
+  const before = structuredClone(state);
+  const nativeUsage = { currentTokens: 497518, tokenLimit: 922000, compactionThreshold: 737600 };
+  const hint = statusContribution(state, nativeUsage, defaults);
+  assert.equal(hint.targets[0].tokens, 404228);
+  assert.equal(contributionLabel(hint, 497518, now).text,
+    'last checkpoint: 281K, next checkpoint: awaiting idle');
+  assert.deepEqual(state, before);
 });
 
 test('native context limit bounds forecasts when the optional compaction threshold is unavailable', () => {
@@ -395,6 +425,9 @@ test('real producer files drive exact configured-command output through the full
     await bridge.on({ type: 'session.idle', data: {} });
     assert.equal(render(), `[existing] | tokens: 505K (${white('56%')}) ${white('last checkpoint: 455K, next checkpoint: in 12m')}`);
     await store.transaction(state => { state.lastOpportunityAt = clock - 60 * 60000; });
+    await bridge.on({ type: 'user.message', data: { messageId: 'synthetic-user', source: 'user', delivery: 'steering' } });
+    assert.equal(render(), `[existing] | tokens: 505K (${white('56%')}) ${white('last checkpoint: 455K, next checkpoint: awaiting idle')}`);
+    assert.deepEqual(notices, []);
     await bridge.on({ type: 'session.idle', data: {} });
     assert.equal(render(), `[existing] | tokens: 505K (${white('56%')}) ${white('last checkpoint: 455K, next checkpoint: ')}${yellow('queued')}`);
     await bridge.on({ type: 'user.message', data: { messageId: 'own-request', source: 'system', delivery: 'idle' } });

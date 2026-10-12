@@ -232,7 +232,7 @@ export function statusContribution(state, usage, config) {
     labels: {
       tokens: `${prefix}{tokens}`,
       time: `${prefix}in {minutes}m`,
-      ready: `${prefix}{tokens}`,
+      ready: `${prefix}awaiting idle`,
       beyond: `${prefix}compaction expected first`,
     },
   };

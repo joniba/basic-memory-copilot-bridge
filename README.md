@@ -177,7 +177,9 @@ next-checkpoint forecast, not the compaction warning or previous checkpoint:
 The next target is the earliest remaining periodic or pressure token trigger.
 Once its tokens qualify but its cooldown remains, the label becomes
 `last checkpoint: 455K, next checkpoint: in 12m`. Once the cooldown expires,
-the token target returns until a checkpoint is actually accepted; there is
+the white forecast becomes `next checkpoint: awaiting idle` until a checkpoint
+is actually accepted, rather than repeating a target already passed. Eligibility
+is not a queued request; normal safe-idle and busy-work checks still apply. There is
 no "next checkpoint now" label. Last checkpoint means the native context-token
 position of the last settled accepted checkpoint turn, not a verified note write.
 It does not advance while a new turn is merely queued or running, and survives

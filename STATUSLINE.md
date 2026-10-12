@@ -130,6 +130,7 @@ The bridge's examples are:
 ```text
 tokens: 500K (55%) last checkpoint: 455K, next checkpoint: 505K
 tokens: 505K (56%) last checkpoint: 455K, next checkpoint: in 12m
+tokens: 505K (56%) last checkpoint: 455K, next checkpoint: awaiting idle
 tokens: 500K (55%) last checkpoint: 455K, next checkpoint: in progress
 tokens: 602K (65% — nearing compaction) last checkpoint: 455K, next checkpoint: queued
 tokens: 216K (79% — compaction imminent) last checkpoint: 198K, next checkpoint: compaction expected first
@@ -138,7 +139,11 @@ tokens: 216K (79% — compaction imminent) last checkpoint: 198K, next checkpoin
 Last/next checkpoint text is white; only `queued`/`in progress` is yellow even
 when the utilization warning is white or red. Finish, abort or failure replaces the
 active contribution with the appropriate hint, independently of the warning. There is no
-"next checkpoint now" bridge label; after cooldown the token target is retained.
+"next checkpoint now" bridge label. A reached target with an elapsed cooldown
+shows white `next checkpoint: awaiting idle` rather than an already-passed count.
+This only describes eligibility; `queued` appears after the SDK accepts a request,
+and `in progress` after its correlated turn starts. The capture gate and
+safe-idle checks are unchanged.
 `last checkpoint: none` means no opportunity yet; `unknown` means an imported
 opportunity had no native token position. Known last positions survive compaction
 and stay on the previous settled turn while a new checkpoint is queued/running.
