@@ -153,6 +153,30 @@ exact compaction timing, and the label does not request immediate post-compactio
 capture. Labels describe checkpoint turns, not verified persistence. Publication failures fail open,
 and a lease expires instead of leaving a permanent activity indicator.
 
+### Publisher I/O recovery and diagnostics
+
+The publisher retries short exclusive-lock contention (`EEXIST`) without stealing
+or deleting an existing lock. On Windows it also retries sharing/access conflicts
+(`EPERM`, `EACCES`, `EBUSY`) while reading the owner record, replacing the JSON file,
+or removing its own temporary/lock files. There are at most six attempts with
+25, 50, 100, 200 and 400 ms waits: no indefinite retry or stale-lock takeover.
+Permanent directory, capacity and invalid-payload errors fail explicitly.
+An initial claim records the owner it observed before waiting for the lock;
+if another process takes ownership meanwhile, the waiting publisher stops
+instead of overwriting the newer signal. The same check protects a heartbeat
+retry after a failed first publication.
+
+Heartbeat renewal always uses the latest requested status, including an update
+that previously failed to reach disk. A failed clear stops renewing old activity,
+so the prior lease expires rather than resurrecting an obsolete label.
+Successful retries do not produce a bridge timeline failure warning.
+
+The extension-process log records only fixed `event`, allowlisted `operation`
+and `code`, `decision` (`recovered`/`failed`), and bounded `attempts`. It never
+logs raw exception text, paths or contribution contents. Each failed renewal is
+reported once. A recovery record identifies the failure class that was handled;
+it does not identify which external process held an incompatible file handle.
+
 ## Tests
 
 ```powershell

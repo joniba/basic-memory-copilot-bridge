@@ -111,6 +111,11 @@ It contains an active label or token/time hint, color, priority, and expiry,
 without prompts, tool contents, paths, or error text. Atomic publication and a
 30-second lease, renewed every ten seconds, prevent stale activity after a
 process exits; a superseded process cannot clear the newer owner's signal.
+Short status-file sharing/lock conflicts are retried within a bounded window,
+without removing another writer's lock. Sanitized operation/error-code diagnostics
+distinguish replacement, lock and cleanup failures. Heartbeats retain the latest
+requested display intent; failed clears let old activity expire instead of
+renewing it indefinitely. See the status-line guide for recovery limits.
 
 The optional compositor reads generic contributions for its own session ID,
 without importing BM code or parsing the bridge's state schema. Compaction warnings
