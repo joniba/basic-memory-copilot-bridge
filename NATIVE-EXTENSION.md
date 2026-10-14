@@ -17,17 +17,22 @@ be available independently.
 copilot plugin disable basic-memory-copilot
 copilot plugin uninstall basic-memory-copilot
 
-# From the extracted repository directory:
-.\scripts\install-extension.ps1
+# Install/update native code only, without changing status-line wiring:
+npx github:joniba/basic-memory-copilot-bridge --update --no-statusline
 copilot --experimental
 ```
 
 Installation copies the four runtime files into
 `%USERPROFILE%\.copilot\extensions\basic-memory-bridge` (or `COPILOT_HOME`).
-It refuses an enabled old plugin or an existing destination instead of
-overwriting another installation. Do not globally reload unrelated extensions
+The npx installer refuses an enabled old plugin. It refreshes managed code only
+with explicit `--update`, preserving capture config and state files and backing
+up replaced code. The original `scripts\install-extension.ps1` remains create-only
+and refuses an existing destination. Do not globally reload unrelated extensions
 to activate this bridge. A new process is the controlled activation path.
 The old plugin's scripts, manifest, config, and tests are no longer shipped.
+See [the installation guide](README.md#install-or-update-with-npx) for pinned
+commits, published feature branches, local Node installation and the default
+combined extension/companion install.
 
 ## Settings and behavior
 
@@ -86,7 +91,10 @@ next periodic watermark. At first cutover, an existing plugin opportunity time
 for the same session is imported to preserve cooldown; byte watermarks are
 never interpreted as tokens. A short-lived exclusive lock and atomic replacement
 protect each state file; a leftover lock fails open and requires owner-checked
-manual recovery rather than automatic age-based removal.
+manual recovery rather than automatic age-based removal. The updater itself
+does not write these state files. Runtime token reconciliation can still rebase
+watermarks after a lower native reading, including on reload with the same
+compaction count; see the installation guide's preservation caveat.
 
 Diagnostics contain only timestamp, session ID, event, ratio, and fixed
 decision codes. Repeated identical decisions are limited to once per minute;
@@ -103,6 +111,11 @@ It contains an active label or token/time hint, color, priority, and expiry,
 without prompts, tool contents, paths, or error text. Atomic publication and a
 30-second lease, renewed every ten seconds, prevent stale activity after a
 process exits; a superseded process cannot clear the newer owner's signal.
+Short status-file sharing/lock conflicts are retried within a bounded window,
+without removing another writer's lock. Sanitized operation/error-code diagnostics
+distinguish replacement, lock and cleanup failures. Heartbeats retain the latest
+requested display intent; failed clears let old activity expire instead of
+renewing it indefinitely. See the status-line guide for recovery limits.
 
 The optional compositor reads generic contributions for its own session ID,
 without importing BM code or parsing the bridge's state schema. Compaction warnings
@@ -110,8 +123,10 @@ remain inside the colored percentage parentheses; checkpoint information stays
 separate at every utilization level. The last/next prefix is white, and only
 the active `queued`/`in progress` suffix is yellow. Idle hints use the
 earliest remaining token threshold alongside the last checkpoint's token position,
-then a countdown once tokens qualify. The token target returns after the cooldown,
-not a "next checkpoint now" label. Last checkpoint history survives context
+then a countdown once tokens qualify. After the cooldown, the white forecast
+shows `next checkpoint: awaiting idle`, not an already-passed token target or
+a "next checkpoint now" label. This is eligibility, not queue admission, and
+does not alter the safe-idle requirement. Last checkpoint history survives context
 rebasing/compaction and advances only when an accepted turn settles, not when
 it is merely accepted and not as proof of a saved note. Forecasts use the native
 `contextInfo.compactionThreshold` as a planning boundary, or the native context

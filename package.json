@@ -1,0 +1,37 @@
+{
+  "name": "basic-memory-copilot-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Native memory checkpoints and composable context status for GitHub Copilot CLI.",
+  "type": "module",
+  "bin": {
+    "basic-memory-copilot-bridge": "scripts/install.mjs"
+  },
+  "files": [
+    "extension/extension.mjs",
+    "extension/bridge.mjs",
+    "extension/status-publisher.mjs",
+    "extension/config.json",
+    "statusline/statusline.mjs",
+    "statusline/contributions.mjs",
+    "scripts/install.mjs",
+    "scripts/install-extension.ps1",
+    "scripts/install-statusline.ps1",
+    "NATIVE-EXTENSION.md",
+    "STATUSLINE.md"
+  ],
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/joniba/basic-memory-copilot-bridge.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1"
+  }
+}

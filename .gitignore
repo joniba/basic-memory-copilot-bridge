@@ -1,3 +1,4 @@
 worktrees/
 .test-artifacts/
 .local/
+node_modules/

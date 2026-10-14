@@ -15,21 +15,33 @@ Installing the BM extension alone does not install or enable this companion.
 
 ## Install
 
-From an extracted revision or existing checkout:
+Install/update the standalone companion from a published revision:
 
 ```powershell
-.\scripts\install-statusline.ps1
+npx github:joniba/basic-memory-copilot-bridge --update --statusline-only
 ```
 
-The installer surgically edits only `statusLine.command` in user settings,
+The default npx command installs both this companion and the native bridge;
+`--no-statusline` skips this component without disabling an existing install.
+From a checkout, restore installer dependencies with `npm install --ignore-scripts`
+and run `node .\scripts\install.mjs --update --statusline-only`. The original
+`scripts\install-statusline.ps1` remains a dependency-free, create-only alternative.
+
+The installer surgically edits `statusLine.command` in user settings,
 preserving unrelated settings (including JSONC comments), padding, and any
 existing refresh interval. When unset, it adds a two-second CLI refresh so
 countdowns update and expired signals disappear. It refuses settings changed
 while installation is in progress. It
 installs under `%USERPROFILE%\.copilot\statusline\context-tokens`, honoring
 `COPILOT_HOME`, and saves the original status-line configuration in its own
-`config.json`. It refuses an existing destination rather than overwriting or
-nesting another compositor. It does not modify the original renderer.
+`config.json`. Managed file replacement requires `--update`; changed originals
+are backed up and unknown files are not purged. An update recognizes its own
+command and keeps its saved renderer config byte-identical, rather than nesting
+another compositor. It preserves `showTokens`, padding and explicit refresh;
+if another installer changed the active renderer, the newly selected renderer
+is composed. Missing, recursive or ambiguous saved wiring fails before changes.
+The original renderer's code is never modified. npx's cache is not used as the
+installed runtime location.
 
 After installation, Copilot invokes the script automatically on status-line
 refreshes. In an already-open session, run `/settings statusLine.padding 0`
@@ -118,6 +130,7 @@ The bridge's examples are:
 ```text
 tokens: 500K (55%) last checkpoint: 455K, next checkpoint: 505K
 tokens: 505K (56%) last checkpoint: 455K, next checkpoint: in 12m
+tokens: 505K (56%) last checkpoint: 455K, next checkpoint: awaiting idle
 tokens: 500K (55%) last checkpoint: 455K, next checkpoint: in progress
 tokens: 602K (65% — nearing compaction) last checkpoint: 455K, next checkpoint: queued
 tokens: 216K (79% — compaction imminent) last checkpoint: 198K, next checkpoint: compaction expected first
@@ -126,7 +139,11 @@ tokens: 216K (79% — compaction imminent) last checkpoint: 198K, next checkpoin
 Last/next checkpoint text is white; only `queued`/`in progress` is yellow even
 when the utilization warning is white or red. Finish, abort or failure replaces the
 active contribution with the appropriate hint, independently of the warning. There is no
-"next checkpoint now" bridge label; after cooldown the token target is retained.
+"next checkpoint now" bridge label. A reached target with an elapsed cooldown
+shows white `next checkpoint: awaiting idle` rather than an already-passed count.
+This only describes eligibility; `queued` appears after the SDK accepts a request,
+and `in progress` after its correlated turn starts. The capture gate and
+safe-idle checks are unchanged.
 `last checkpoint: none` means no opportunity yet; `unknown` means an imported
 opportunity had no native token position. Known last positions survive compaction
 and stay on the previous settled turn while a new checkpoint is queued/running.
@@ -135,6 +152,30 @@ native context limit as fallback. This is not a hard maximum or a guarantee abou
 exact compaction timing, and the label does not request immediate post-compaction
 capture. Labels describe checkpoint turns, not verified persistence. Publication failures fail open,
 and a lease expires instead of leaving a permanent activity indicator.
+
+### Publisher I/O recovery and diagnostics
+
+The publisher retries short exclusive-lock contention (`EEXIST`) without stealing
+or deleting an existing lock. On Windows it also retries sharing/access conflicts
+(`EPERM`, `EACCES`, `EBUSY`) while reading the owner record, replacing the JSON file,
+or removing its own temporary/lock files. There are at most six attempts with
+25, 50, 100, 200 and 400 ms waits: no indefinite retry or stale-lock takeover.
+Permanent directory, capacity and invalid-payload errors fail explicitly.
+An initial claim records the owner it observed before waiting for the lock;
+if another process takes ownership meanwhile, the waiting publisher stops
+instead of overwriting the newer signal. The same check protects a heartbeat
+retry after a failed first publication.
+
+Heartbeat renewal always uses the latest requested status, including an update
+that previously failed to reach disk. A failed clear stops renewing old activity,
+so the prior lease expires rather than resurrecting an obsolete label.
+Successful retries do not produce a bridge timeline failure warning.
+
+The extension-process log records only fixed `event`, allowlisted `operation`
+and `code`, `decision` (`recovered`/`failed`), and bounded `attempts`. It never
+logs raw exception text, paths or contribution contents. Each failed renewal is
+reported once. A recovery record identifies the failure class that was handled;
+it does not identify which external process held an incompatible file handle.
 
 ## Tests
 
