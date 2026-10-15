@@ -133,7 +133,44 @@ there is no byte fallback. Compaction resets context baselines, and a missed
 pre-compaction opportunity does not schedule a recovery capture afterward.
 Capture before every compaction is not guaranteed.
 
-Edit the installed `config.json`, not the checkout. Capture and bounded debug
+The extension also registers a native `/bm-bridge` command, without starting an
+agent turn. It follows the CLI's normal command availability rules and is not
+marked for execution during an active agent turn:
+
+```text
+/bm-bridge
+/bm-bridge help
+/bm-bridge interval
+/bm-bridge interval 100
+```
+
+Type `/bm-bridge` and press Enter to open an interactive action menu. It shows
+the current interval and shared scope, with **Change interval**, **Current settings**
+and **Help** choices. Changing the interval opens an input form with the current
+value and units; cancelling either dialog leaves settings unchanged.
+
+Inline `help` (also `--help` or `-h`) and `interval` without a value show the
+current settings, supported operations, scope and examples without opening a
+dialog. The command-menu description includes `menu | help | interval <K>`.
+The extension SDK does not expose argument autocomplete; the interactive menu
+opens after Enter, not as a suggestion popup while typing.
+If `/bm-bridge` itself is missing from completion, an existing process may still
+have the old extension loaded: npx updates disk files, not running modules.
+A new Copilot process or an explicitly approved extension reload is needed.
+
+`/bm-bridge interval 100` saves **100,000 tokens**
+as `periodicMinimumNewTokens` in the installed config. Use a positive integer
+in thousands; `interval 50` restores the default. This is a **machine-wide**
+setting for sessions sharing the same Copilot home and persists across restarts
+and reinstalls. The issuing session refreshes its checkpoint forecast; other
+sessions adopt the setting on their next native event. Existing checkpoint
+history, progress toward the next opportunity, accepted requests, time cooldown
+and pressure rules are unchanged.
+This version does not support session overrides, `reset`, or `--global`.
+Hosts without interactive UI support report that limitation; inline operations
+remain available.
+
+You can also edit the installed `config.json`, not the checkout. Capture and bounded debug
 logging are enabled by default. Set `enabled: false` to stop new automatic offers.
 
 ## Optional token status line

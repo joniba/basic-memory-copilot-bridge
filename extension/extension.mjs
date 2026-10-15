@@ -5,15 +5,20 @@ import { fileURLToPath } from 'node:url';
 import { joinSession } from '@github/copilot-sdk/extension';
 import { CaptureBridge, createLogger, FileStateStore, validateConfig } from './bridge.mjs';
 import { StatusPublisher } from './status-publisher.mjs';
+import { bridgeCommand } from './commands.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const home = process.env.COPILOT_HOME || join(homedir(), '.copilot');
 let session;
+let bridge;
 try {
-  session = await joinSession({ tools: [], hooks: {} });
+  session = await joinSession({
+    tools: [], hooks: {},
+    commands: [bridgeCommand(join(root, 'config.json'), () => bridge)],
+  });
   const stateRoot = join(home, 'extension-state', 'basic-memory-bridge');
   const publisher = new StatusPublisher(join(home, 'statusline', 'contributions'), session.sessionId, 'basic-memory-bridge');
-  const bridge = new CaptureBridge({
+  bridge = new CaptureBridge({
     session,
     store: new FileStateStore(join(stateRoot, 'sessions'), session.sessionId, {
       legacyDirectory: join(home, 'plugin-data', '_direct'),

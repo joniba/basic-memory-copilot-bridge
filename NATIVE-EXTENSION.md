@@ -1,7 +1,7 @@
 # Native Basic Memory bridge
 
 The extension under `extension\` joins the existing interactive Copilot CLI
-session using its bundled SDK. It adds no tools, shell hooks, MCP server,
+session using its bundled SDK. It registers the native `/bm-bridge` slash command but adds no tools, shell hooks, MCP server,
 custom skill, or independent model client. It is not activated by checking
 out this repository. Native SDK types and interactive delivery were checked
 against CLI 1.0.93-2. The shell-hook plugin is retired; its source remains
@@ -22,7 +22,7 @@ npx github:joniba/basic-memory-copilot-bridge --update --no-statusline
 copilot --experimental
 ```
 
-Installation copies the four runtime files into
+Installation copies the five runtime files into
 `%USERPROFILE%\.copilot\extensions\basic-memory-bridge` (or `COPILOT_HOME`).
 The npx installer refuses an enabled old plugin. It refreshes managed code only
 with explicit `--update`, preserving capture config and state files and backing
@@ -36,7 +36,43 @@ combined extension/companion install.
 
 ## Settings and behavior
 
-Edit the installed `config.json`; it is read on events without reinstalling.
+Invoke bare `/bm-bridge` to open a native interactive menu, showing the current
+interval, shared scope and descriptions of **Change interval**, **Current settings**
+and **Help**. The interval input is prefilled with the current value in K tokens;
+cancelling selection or input makes no change. Menus use the SDK's interactive
+UI, not a model prompt. Missing UI support or dialog failures are reported
+explicitly, and inline forms remain usable.
+
+Use `/bm-bridge help` (also `--help` or `-h`) or `/bm-bridge interval` to inspect
+the interval, time and pressure settings and list supported operations/examples
+without opening a menu. The description advertises `menu | help | interval <K>`.
+The extension SDK accepts the command name and description, but has no input
+choice/argument-completion field. Only the top-level `/bm-bridge` is advertised
+for completion. The interactive menu opens after Enter, not while typing.
+If the command is absent, check that the running process has loaded the
+installed revision; copying code with npx does not reload existing extensions.
+Do not mistake an isolated native command-catalog test for visual TUI acceptance.
+
+Use `/bm-bridge interval 100` to save a 100,000-token growth requirement.
+The argument is a positive integer in thousands; `interval 50` restores the
+default. This changes only `periodicMinimumNewTokens` in the installed
+`config.json`, for all sessions sharing that Copilot home, and persists across
+restarts and updates. The native CLI controls command dispatch; this command
+is not marked for execution during an active agent turn. It does not invoke
+an agent turn, alter time/pressure
+rules, reset accumulated progress or history, or cancel an accepted checkpoint.
+The issuing session refreshes its status contribution without writing capture
+state; other sessions read the new config on their next native event.
+Session overrides, `reset`, and `--global` are not supported in this version.
+
+Updates use an exclusive, owner-checked config lock and atomic replacement.
+Invalid input/config, competing changes and I/O failures are reported explicitly.
+The command never steals an existing lock or deletes a competing edit. A failed
+replacement retains the staged file for inspection. Do not blindly retry or
+remove locks after an update error. Configuration values other than the interval
+are preserved; JSON whitespace may be normalized.
+
+You can also edit the installed `config.json`; it is read on events without reinstalling.
 
 | Setting | Default |
 | --- | --- |
