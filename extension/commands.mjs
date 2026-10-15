@@ -2,13 +2,27 @@ import { randomUUID } from 'node:crypto';
 import * as files from 'node:fs/promises';
 import { validateConfig, bounded } from './bridge.mjs';
 
-const usage = 'Usage: /bm-bridge interval <positive integer in K tokens>; for example, /bm-bridge interval 100.';
+const usage = 'Usage: /bm-bridge interval <positive integer in K tokens>; for example, /bm-bridge interval 100. Run /bm-bridge help for all supported operations.';
+const help = [
+  'Supported operations:',
+  '  /bm-bridge                     Show the current interval and this help.',
+  '  /bm-bridge help                Show this help (also --help or -h).',
+  '  /bm-bridge interval            Show the current interval and this help.',
+  '  /bm-bridge interval <K>        Save the periodic interval in thousands of tokens.',
+  '',
+  'Examples: interval 100 = 100,000 tokens; interval 50 = 50,000 tokens (the built-in default).',
+  'Scope: shared by all sessions using this bridge installation; saved across restarts.',
+  'Session overrides, reset and --global are not supported in this version.',
+  'Only periodic token growth changes. Time cooldowns, pressure rules and checkpoint history stay unchanged.',
+  'Checkpoints still wait for safe idle. Other sessions adopt updates on their next native event.',
+  'Autocomplete lists /bm-bridge only; use help to discover its operations.',
+].join('\n');
 const codes = new Set(['EACCES', 'EPERM', 'EBUSY', 'EEXIST', 'ENOENT', 'ENOSPC', 'EIO', 'ENOTDIR', 'EISDIR']);
 
 export function parseCommand(args) {
   if (typeof args !== 'string') throw new Error(usage);
   const parts = args.trim().split(/\s+/).filter(Boolean);
-  if (!parts.length || (parts.length === 1 && ['help', 'interval'].includes(parts[0]))) return null;
+  if (!parts.length || (parts.length === 1 && ['help', '--help', '-h', 'interval'].includes(parts[0]))) return null;
   if (parts.length !== 2 || parts[0] !== 'interval' || !/^\d+$/.test(parts[1])) throw new Error(usage);
   const tokens = Number(parts[1]) * 1000;
   if (!Number.isSafeInteger(tokens) || tokens <= 0) throw new Error(usage);
@@ -85,7 +99,7 @@ function failureMessage(error) {
 export function bridgeCommand(path, getBridge) {
   return {
     name: 'bm-bridge',
-    description: 'Show or change the machine-wide memory checkpoint interval in K tokens.',
+    description: 'Memory checkpoints: help | interval <K>. Global setting; interval 100 = 100K tokens.',
     handler: async context => {
       const bridge = getBridge();
       if (!bridge) throw new Error('Basic Memory bridge is still attaching. Try /bm-bridge again shortly.');
@@ -112,10 +126,10 @@ export function bridgeCommand(path, getBridge) {
         try {
           config = validateConfig(JSON.parse(await files.readFile(path, 'utf8')));
         } catch {
-          await notify('The installed bridge configuration could not be read or is invalid.', 'warning');
+          await notify(`The installed bridge configuration could not be read or is invalid. No settings changed.\n\n${help}`, 'warning');
           return;
         }
-        await notify(`Machine-wide periodic interval: ${config.periodicMinimumNewTokens / 1000}K tokens; minimum time: ${config.minimumMinutesBetweenOpportunities}m. Pressure rules are independent. ${usage}`);
+        await notify(`Machine-wide periodic interval: ${config.periodicMinimumNewTokens / 1000}K tokens; minimum time: ${config.minimumMinutesBetweenOpportunities}m.\n\n${help}`);
         return;
       }
       let result;

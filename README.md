@@ -139,10 +139,21 @@ marked for execution during an active agent turn:
 
 ```text
 /bm-bridge
+/bm-bridge help
+/bm-bridge interval
 /bm-bridge interval 100
 ```
 
-The first command shows the current interval. The second saves **100,000 tokens**
+Bare `/bm-bridge`, `help` (also `--help` or `-h`), and `interval` without a value
+show the current interval, supported operations, scope and examples.
+The command-menu description includes `help | interval <K>`. The extension SDK
+registers the top-level command only; it does not expose argument autocomplete.
+Use `/bm-bridge help` rather than expecting suggestions after `/bm-bridge `.
+If `/bm-bridge` itself is missing from completion, an existing process may still
+have the old extension loaded: npx updates disk files, not running modules.
+A new Copilot process or an explicitly approved extension reload is needed.
+
+`/bm-bridge interval 100` saves **100,000 tokens**
 as `periodicMinimumNewTokens` in the installed config. Use a positive integer
 in thousands; `interval 50` restores the default. This is a **machine-wide**
 setting for sessions sharing the same Copilot home and persists across restarts
@@ -150,6 +161,7 @@ and reinstalls. The issuing session refreshes its checkpoint forecast; other
 sessions adopt the setting on their next native event. Existing checkpoint
 history, progress toward the next opportunity, accepted requests, time cooldown
 and pressure rules are unchanged.
+This version does not support session overrides, `reset`, or `--global`.
 
 You can also edit the installed `config.json`, not the checkout. Capture and bounded debug
 logging are enabled by default. Set `enabled: false` to stop new automatic offers.

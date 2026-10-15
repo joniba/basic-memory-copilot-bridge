@@ -48,7 +48,7 @@ test('native command parses positive integer thousands and supports inspection/h
   assert.equal(parseCommand('interval 100'), 100000);
   assert.equal(parseCommand(' interval 50 '), 50000);
   assert.equal(parseCommand('interval 9007199254740'), 9007199254740000);
-  for (const args of ['', 'help', 'interval']) assert.equal(parseCommand(args), null);
+  for (const args of ['', 'help', '--help', '-h', 'interval']) assert.equal(parseCommand(args), null);
   for (const args of ['interval 0', 'interval -1', 'interval 1.5', 'interval 100K',
     'interval 1e2', 'interval Infinity', 'interval 9007199254741', 'interval 100 extra',
     'disable', 'help extra', null]) {
@@ -197,6 +197,58 @@ test('invalid command only warns, inspection reports current saved value, and re
   const restarted = bridgeCommand(f.path, () => f.bridge);
   await restarted.handler({ sessionId: f.session.sessionId, args: 'interval' });
   assert.match(f.logs.at(-1).message, /100K/);
+});
+
+test('native completion description advertises supported operations, units and global scope', async () => {
+  const f = await fixture();
+  assert.match(f.command.description, /help \| interval <K>/);
+  assert.match(f.command.description, /Global setting/);
+  assert.match(f.command.description, /interval 100 = 100K/);
+});
+
+test('all help and inspection forms list operations and examples without changing settings or history', async () => {
+  const f = await fixture();
+  const configBefore = await files.readFile(f.path);
+  const stateBefore = await files.readFile(f.store.path);
+  for (const args of ['', 'help', '--help', '-h', 'interval']) {
+    await f.invoke(args);
+    const { message, options } = f.logs.at(-1);
+    assert.equal(options.level, 'info');
+    assert.match(message, /periodic interval: 50K tokens; minimum time: 60m/);
+    assert.match(message, /Supported operations:/);
+    assert.match(message, /\/bm-bridge help/);
+    assert.match(message, /\/bm-bridge interval <K>/);
+    assert.match(message, /interval 100 = 100,000 tokens/);
+    assert.match(message, /Session overrides, reset and --global are not supported/);
+    assert.match(message, /Time cooldowns, pressure rules and checkpoint history stay unchanged/);
+    assert.match(message, /Autocomplete lists \/bm-bridge only/);
+  }
+  assert.deepEqual(await files.readFile(f.path), configBefore);
+  assert.deepEqual(await files.readFile(f.store.path), stateBefore);
+  assert.equal(f.statuses.length, 0);
+});
+
+test('invalid commands point to discoverable help without applying a supported prefix', async () => {
+  const f = await fixture();
+  const before = await files.readFile(f.path);
+  for (const args of ['interval 100 --global', 'help extra', 'interval reset', 'unknown']) {
+    await f.invoke(args);
+    assert.equal(f.logs.at(-1).options.level, 'warning');
+    assert.match(f.logs.at(-1).message, /Run \/bm-bridge help/);
+  }
+  assert.deepEqual(await files.readFile(f.path), before);
+});
+
+test('help remains available when installed settings cannot be read or validated', async () => {
+  const f = await fixture();
+  await files.writeFile(f.path, '{invalid');
+  await f.invoke('help');
+  assert.equal(f.logs.at(-1).options.level, 'warning');
+  assert.match(f.logs.at(-1).message, /configuration could not be read or is invalid/);
+  assert.match(f.logs.at(-1).message, /Supported operations:/);
+  assert.match(f.logs.at(-1).message, /\/bm-bridge interval <K>/);
+  assert.equal(await files.readFile(f.path, 'utf8'), '{invalid');
+  assert.equal(f.statuses.length, 0);
 });
 
 test('startup/session mismatch errors are explicit and cannot change configuration', async () => {

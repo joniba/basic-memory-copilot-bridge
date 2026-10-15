@@ -36,8 +36,16 @@ combined extension/companion install.
 
 ## Settings and behavior
 
-Use `/bm-bridge` to inspect the machine-wide periodic interval, or
-`/bm-bridge interval 100` to save a 100,000-token growth requirement.
+Use `/bm-bridge`, `/bm-bridge help` (also `--help` or `-h`), or
+`/bm-bridge interval` to inspect the interval and list every supported operation,
+scope and examples. The command-menu description advertises `help | interval <K>`.
+The extension SDK accepts the command name and description, but has no input
+choice/argument-completion field. Only the top-level `/bm-bridge` is advertised
+for completion. If that is absent, check that the running process has loaded the
+installed revision; copying code with npx does not reload existing extensions.
+Do not mistake an isolated native command-catalog test for visual TUI acceptance.
+
+Use `/bm-bridge interval 100` to save a 100,000-token growth requirement.
 The argument is a positive integer in thousands; `interval 50` restores the
 default. This changes only `periodicMinimumNewTokens` in the installed
 `config.json`, for all sessions sharing that Copilot home, and persists across
@@ -47,6 +55,7 @@ an agent turn, alter time/pressure
 rules, reset accumulated progress or history, or cancel an accepted checkpoint.
 The issuing session refreshes its status contribution without writing capture
 state; other sessions read the new config on their next native event.
+Session overrides, `reset`, and `--global` are not supported in this version.
 
 Updates use an exclusive, owner-checked config lock and atomic replacement.
 Invalid input/config, competing changes and I/O failures are reported explicitly.
