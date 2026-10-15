@@ -144,11 +144,16 @@ marked for execution during an active agent turn:
 /bm-bridge interval 100
 ```
 
-Bare `/bm-bridge`, `help` (also `--help` or `-h`), and `interval` without a value
-show the current interval, supported operations, scope and examples.
-The command-menu description includes `help | interval <K>`. The extension SDK
-registers the top-level command only; it does not expose argument autocomplete.
-Use `/bm-bridge help` rather than expecting suggestions after `/bm-bridge `.
+Type `/bm-bridge` and press Enter to open an interactive action menu. It shows
+the current interval and shared scope, with **Change interval**, **Current settings**
+and **Help** choices. Changing the interval opens an input form with the current
+value and units; cancelling either dialog leaves settings unchanged.
+
+Inline `help` (also `--help` or `-h`) and `interval` without a value show the
+current settings, supported operations, scope and examples without opening a
+dialog. The command-menu description includes `menu | help | interval <K>`.
+The extension SDK does not expose argument autocomplete; the interactive menu
+opens after Enter, not as a suggestion popup while typing.
 If `/bm-bridge` itself is missing from completion, an existing process may still
 have the old extension loaded: npx updates disk files, not running modules.
 A new Copilot process or an explicitly approved extension reload is needed.
@@ -162,6 +167,8 @@ sessions adopt the setting on their next native event. Existing checkpoint
 history, progress toward the next opportunity, accepted requests, time cooldown
 and pressure rules are unchanged.
 This version does not support session overrides, `reset`, or `--global`.
+Hosts without interactive UI support report that limitation; inline operations
+remain available.
 
 You can also edit the installed `config.json`, not the checkout. Capture and bounded debug
 logging are enabled by default. Set `enabled: false` to stop new automatic offers.

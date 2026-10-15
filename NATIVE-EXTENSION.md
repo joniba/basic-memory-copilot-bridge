@@ -36,12 +36,20 @@ combined extension/companion install.
 
 ## Settings and behavior
 
-Use `/bm-bridge`, `/bm-bridge help` (also `--help` or `-h`), or
-`/bm-bridge interval` to inspect the interval and list every supported operation,
-scope and examples. The command-menu description advertises `help | interval <K>`.
+Invoke bare `/bm-bridge` to open a native interactive menu, showing the current
+interval, shared scope and descriptions of **Change interval**, **Current settings**
+and **Help**. The interval input is prefilled with the current value in K tokens;
+cancelling selection or input makes no change. Menus use the SDK's interactive
+UI, not a model prompt. Missing UI support or dialog failures are reported
+explicitly, and inline forms remain usable.
+
+Use `/bm-bridge help` (also `--help` or `-h`) or `/bm-bridge interval` to inspect
+the interval, time and pressure settings and list supported operations/examples
+without opening a menu. The description advertises `menu | help | interval <K>`.
 The extension SDK accepts the command name and description, but has no input
 choice/argument-completion field. Only the top-level `/bm-bridge` is advertised
-for completion. If that is absent, check that the running process has loaded the
+for completion. The interactive menu opens after Enter, not while typing.
+If the command is absent, check that the running process has loaded the
 installed revision; copying code with npx does not reload existing extensions.
 Do not mistake an isolated native command-catalog test for visual TUI acceptance.
 

@@ -25,8 +25,16 @@ async function fixture(config = defaults, stateChanges = {}, sharedPath) {
   await files.writeFile(store.path, JSON.stringify(state));
   const logs = [];
   const statuses = [];
+  const dialogs = [];
+  let selected = null;
+  let entered = null;
   const session = {
     sessionId: id,
+    capabilities: { ui: { elicitation: true } },
+    ui: {
+      select: async (message, choices) => { dialogs.push({ kind: 'select', message, choices }); return selected; },
+      input: async (message, options) => { dialogs.push({ kind: 'input', message, options }); return entered; },
+    },
     log: async (message, options) => logs.push({ message, options }),
     send: async () => { assert.fail('A slash command must not start a model turn.'); },
   };
@@ -39,7 +47,9 @@ async function fixture(config = defaults, stateChanges = {}, sharedPath) {
   bridge.ready = true;
   const command = bridgeCommand(path, () => bridge);
   return {
-    path, directory, store, state, bridge, session, command, logs, statuses,
+    path, directory, store, state, bridge, session, command, logs, statuses, dialogs,
+    select: value => { selected = value; },
+    input: value => { entered = value; },
     invoke: args => command.handler({ sessionId: id, commandName: 'bm-bridge', command: `/bm-bridge ${args}`, args }),
   };
 }
@@ -192,7 +202,7 @@ test('invalid command only warns, inspection reports current saved value, and re
   assert.deepEqual(await files.readFile(f.path), before);
   assert.equal(f.logs.at(-1).options.level, 'warning');
   await f.invoke('interval 100');
-  await f.invoke('');
+  await f.invoke('help');
   assert.match(f.logs.at(-1).message, /100K tokens; minimum time: 60m/);
   const restarted = bridgeCommand(f.path, () => f.bridge);
   await restarted.handler({ sessionId: f.session.sessionId, args: 'interval' });
@@ -210,7 +220,7 @@ test('all help and inspection forms list operations and examples without changin
   const f = await fixture();
   const configBefore = await files.readFile(f.path);
   const stateBefore = await files.readFile(f.store.path);
-  for (const args of ['', 'help', '--help', '-h', 'interval']) {
+  for (const args of ['help', '--help', '-h', 'interval']) {
     await f.invoke(args);
     const { message, options } = f.logs.at(-1);
     assert.equal(options.level, 'info');
@@ -221,7 +231,7 @@ test('all help and inspection forms list operations and examples without changin
     assert.match(message, /interval 100 = 100,000 tokens/);
     assert.match(message, /Session overrides, reset and --global are not supported/);
     assert.match(message, /Time cooldowns, pressure rules and checkpoint history stay unchanged/);
-    assert.match(message, /Autocomplete lists \/bm-bridge only/);
+    assert.match(message, /press Enter for the menu/);
   }
   assert.deepEqual(await files.readFile(f.path), configBefore);
   assert.deepEqual(await files.readFile(f.store.path), stateBefore);
@@ -249,6 +259,105 @@ test('help remains available when installed settings cannot be read or validated
   assert.match(f.logs.at(-1).message, /\/bm-bridge interval <K>/);
   assert.equal(await files.readFile(f.path, 'utf8'), '{invalid');
   assert.equal(f.statuses.length, 0);
+});
+
+test('bare command opens a described native menu and cancellation changes nothing', async () => {
+  const f = await fixture();
+  const before = await files.readFile(f.path);
+  const stateBefore = await files.readFile(f.store.path);
+  await f.invoke('');
+  assert.equal(f.dialogs.length, 1);
+  assert.deepEqual(f.dialogs[0].choices, ['Change interval', 'Current settings', 'Help']);
+  assert.match(f.dialogs[0].message, /Current periodic interval: 50K/);
+  assert.match(f.dialogs[0].message, /all sessions sharing/);
+  assert.match(f.dialogs[0].message, /Change interval: choose/);
+  assert.equal(f.logs.length, 0);
+  assert.equal(f.statuses.length, 0);
+  assert.deepEqual(await files.readFile(f.path), before);
+  assert.deepEqual(await files.readFile(f.store.path), stateBefore);
+});
+
+test('menu interval form uses the current value and the existing validated update path', async () => {
+  const f = await fixture();
+  const stateBefore = await files.readFile(f.store.path);
+  f.select('Change interval');
+  f.input('100');
+  await f.invoke('  ');
+  assert.equal(f.dialogs.length, 2);
+  assert.equal(f.dialogs[1].options.default, '50');
+  assert.match(f.dialogs[1].options.description, /Applies to all sessions/);
+  assert.equal(JSON.parse(await files.readFile(f.path)).periodicMinimumNewTokens, 100000);
+  assert.equal(f.statuses.at(-1).targets[0].tokens, 101000);
+  assert.deepEqual(await files.readFile(f.store.path), stateBefore);
+  assert.match(f.logs.at(-1).message, /interval set to 100K/);
+});
+
+test('cancelling interval input or submitting invalid input leaves settings untouched', async () => {
+  const f = await fixture();
+  const before = await files.readFile(f.path);
+  f.select('Change interval');
+  await f.invoke('');
+  assert.equal(f.logs.length, 0);
+  assert.deepEqual(await files.readFile(f.path), before);
+  for (const value of ['', '0', '-1', '1.5', '100 --global']) {
+    f.input(value);
+    await f.invoke('');
+    assert.equal(f.logs.at(-1).options.level, 'warning');
+    assert.match(f.logs.at(-1).message, /Usage:/);
+    assert.deepEqual(await files.readFile(f.path), before);
+  }
+  assert.equal(f.statuses.length, 0);
+});
+
+test('menu settings and help expose current details while preserving inline operations', async () => {
+  const f = await fixture();
+  const before = await files.readFile(f.path);
+  for (const selected of ['Current settings', 'Help']) {
+    f.select(selected);
+    await f.invoke('');
+    assert.match(f.logs.at(-1).message, /Supported operations:/);
+    assert.match(f.logs.at(-1).message, /Pressure: 65%; minimum time: 5m/);
+    assert.match(f.logs.at(-1).message, /minimum time: 60m/);
+    assert.deepEqual(await files.readFile(f.path), before);
+  }
+  const dialogCount = f.dialogs.length;
+  await f.invoke('interval 100');
+  assert.equal(f.dialogs.length, dialogCount);
+  assert.equal(JSON.parse(await files.readFile(f.path)).periodicMinimumNewTokens, 100000);
+});
+
+test('menu requires UI capability but inline commands remain usable without it', async () => {
+  const f = await fixture();
+  f.session.capabilities.ui.elicitation = false;
+  await f.invoke('');
+  assert.equal(f.dialogs.length, 0);
+  assert.equal(f.logs.at(-1).options.level, 'warning');
+  assert.match(f.logs.at(-1).message, /requires an interactive Copilot UI/);
+  await f.invoke('help');
+  assert.match(f.logs.at(-1).message, /Supported operations:/);
+  await f.invoke('interval 100');
+  assert.equal(JSON.parse(await files.readFile(f.path)).periodicMinimumNewTokens, 100000);
+});
+
+test('menu failures are explicit and sanitized rather than changing configuration', async () => {
+  const f = await fixture();
+  const before = await files.readFile(f.path);
+  f.session.ui.select = async () => { throw new Error('private-ui-error'); };
+  await f.invoke('');
+  assert.equal(f.logs.at(-1).options.level, 'warning');
+  assert.match(f.logs.at(-1).message, /action menu failed. No settings changed/);
+  assert.ok(!f.logs.at(-1).message.includes('private-ui-error'));
+  assert.deepEqual(await files.readFile(f.path), before);
+});
+
+test('menu configuration failure shows available inline help without opening a misleading dialog', async () => {
+  const f = await fixture();
+  await files.writeFile(f.path, '{invalid');
+  await f.invoke('');
+  assert.equal(f.dialogs.length, 0);
+  assert.equal(f.logs.at(-1).options.level, 'warning');
+  assert.match(f.logs.at(-1).message, /Supported operations:/);
+  assert.equal(await files.readFile(f.path, 'utf8'), '{invalid');
 });
 
 test('startup/session mismatch errors are explicit and cannot change configuration', async () => {

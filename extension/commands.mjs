@@ -5,7 +5,7 @@ import { validateConfig, bounded } from './bridge.mjs';
 const usage = 'Usage: /bm-bridge interval <positive integer in K tokens>; for example, /bm-bridge interval 100. Run /bm-bridge help for all supported operations.';
 const help = [
   'Supported operations:',
-  '  /bm-bridge                     Show the current interval and this help.',
+  '  /bm-bridge                     Open the interactive action menu.',
   '  /bm-bridge help                Show this help (also --help or -h).',
   '  /bm-bridge interval            Show the current interval and this help.',
   '  /bm-bridge interval <K>        Save the periodic interval in thousands of tokens.',
@@ -15,7 +15,7 @@ const help = [
   'Session overrides, reset and --global are not supported in this version.',
   'Only periodic token growth changes. Time cooldowns, pressure rules and checkpoint history stay unchanged.',
   'Checkpoints still wait for safe idle. Other sessions adopt updates on their next native event.',
-  'Autocomplete lists /bm-bridge only; use help to discover its operations.',
+  'Type /bm-bridge and press Enter for the menu. Inline argument suggestions are not available.',
 ].join('\n');
 const codes = new Set(['EACCES', 'EPERM', 'EBUSY', 'EEXIST', 'ENOENT', 'ENOSPC', 'EIO', 'ENOTDIR', 'EISDIR']);
 
@@ -96,10 +96,37 @@ function failureMessage(error) {
   return `Interval update failed (${error.code ?? 'UNKNOWN'}). No successful change is being reported.`;
 }
 
+async function readConfiguration(path) {
+  return validateConfig(JSON.parse(await files.readFile(path, 'utf8')));
+}
+
+async function menu(session, config) {
+  const selected = await session.ui.select([
+    'Basic Memory bridge',
+    `Current periodic interval: ${config.periodicMinimumNewTokens / 1000}K tokens.`,
+    'Scope: all sessions sharing this bridge installation.',
+    '',
+    'Change interval: choose the periodic token-growth requirement.',
+    'Current settings: view the interval, time cooldown and pressure policy.',
+    'Help: view inline commands and examples.',
+  ].join('\n'), ['Change interval', 'Current settings', 'Help']);
+  if (selected === null) return null;
+  if (selected === 'Help') return 'help';
+  if (selected === 'Current settings') return 'interval';
+  if (selected !== 'Change interval') throw new Error('menu-selection-invalid');
+  const value = await session.ui.input('Change the shared periodic checkpoint interval', {
+    title: 'Interval (K tokens)',
+    description: 'Positive whole number in thousands: 100 means 100,000 tokens. Applies to all sessions sharing this installation. Time and pressure rules stay unchanged.',
+    default: String(config.periodicMinimumNewTokens / 1000),
+    minLength: 1,
+  });
+  return value === null ? null : value.trim() ? `interval ${value}` : '';
+}
+
 export function bridgeCommand(path, getBridge) {
   return {
     name: 'bm-bridge',
-    description: 'Memory checkpoints: help | interval <K>. Global setting; interval 100 = 100K tokens.',
+    description: 'Memory checkpoints: menu | help | interval <K>. Global setting; interval 100 = 100K tokens.',
     handler: async context => {
       const bridge = getBridge();
       if (!bridge) throw new Error('Basic Memory bridge is still attaching. Try /bm-bridge again shortly.');
@@ -114,9 +141,35 @@ export function bridgeCommand(path, getBridge) {
             : 'Basic Memory command output could not be displayed.');
         }
       };
+      let args = context.args;
+      if (typeof args === 'string' && !args.trim()) {
+        if (!bridge.session.capabilities?.ui?.elicitation || !bridge.session.ui) {
+          await notify('The action menu requires an interactive Copilot UI. Use /bm-bridge help or /bm-bridge interval <K> instead.', 'warning');
+          return;
+        }
+        let config;
+        try {
+          config = await readConfiguration(path);
+        } catch {
+          await notify(`The installed bridge configuration could not be read or is invalid. No settings changed.\n\n${help}`, 'warning');
+          return;
+        }
+        try {
+          args = await menu(bridge.session, config);
+        } catch {
+          console.error('{"event":"command","gateDecision":"menu-error"}');
+          await notify('The action menu failed. No settings changed. Inline /bm-bridge help and /bm-bridge interval <K> remain available.', 'warning');
+          return;
+        }
+        if (args === null) return;
+        if (!args) {
+          await notify(usage, 'warning');
+          return;
+        }
+      }
       let tokens;
       try {
-        tokens = parseCommand(context.args);
+        tokens = parseCommand(args);
       } catch {
         await notify(usage, 'warning');
         return;
@@ -124,12 +177,16 @@ export function bridgeCommand(path, getBridge) {
       if (tokens === null) {
         let config;
         try {
-          config = validateConfig(JSON.parse(await files.readFile(path, 'utf8')));
+          config = await readConfiguration(path);
         } catch {
           await notify(`The installed bridge configuration could not be read or is invalid. No settings changed.\n\n${help}`, 'warning');
           return;
         }
-        await notify(`Machine-wide periodic interval: ${config.periodicMinimumNewTokens / 1000}K tokens; minimum time: ${config.minimumMinutesBetweenOpportunities}m.\n\n${help}`);
+        await notify([
+          `Machine-wide periodic interval: ${config.periodicMinimumNewTokens / 1000}K tokens; minimum time: ${config.minimumMinutesBetweenOpportunities}m.`,
+          `Automatic checkpoints: ${config.enabled ? 'enabled' : 'disabled'}. Pressure: ${config.contextPressureThreshold * 100}%; minimum time: ${config.pressureMinimumMinutesBetweenOpportunities}m; once per compaction epoch.`,
+          '', help,
+        ].join('\n'));
         return;
       }
       let result;
