@@ -10,6 +10,7 @@
   "files": [
     "extension/extension.mjs",
     "extension/bridge.mjs",
+    "extension/commands.mjs",
     "extension/status-publisher.mjs",
     "extension/config.json",
     "statusline/statusline.mjs",

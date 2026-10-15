@@ -364,6 +364,10 @@ export class CaptureBridge {
     return this.queue;
   }
 
+  refreshConfiguration() {
+    return this.enqueue(async () => this.publishStatus(await this.readConfig()));
+  }
+
   start() {
     return this.enqueue(() => this.initialize());
   }

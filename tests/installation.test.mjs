@@ -9,7 +9,7 @@ import { options, patchSettings, planInstallation, applyInstallation, statusComm
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 await mkdir(join(root, '.test-artifacts'), { recursive: true });
 const run = await mkdtemp(join(root, '.test-artifacts', 'installation-'));
-const extensionNames = ['config.json', 'status-publisher.mjs', 'bridge.mjs', 'extension.mjs'];
+const extensionNames = ['config.json', 'status-publisher.mjs', 'bridge.mjs', 'commands.mjs', 'extension.mjs'];
 const compositorNames = ['config.json', 'contributions.mjs', 'statusline.mjs'];
 const readJson = async path => JSON.parse(await readFile(path, 'utf8'));
 const selection = (home, more = {}) => ({ home, extension: true, statusline: true, update: false, ...more });
@@ -38,6 +38,7 @@ test('package ships one executable and an explicit runtime/docs allowlist withou
   assert.equal(manifest.type, 'module');
   assert.ok(manifest.dependencies['jsonc-parser']);
   assert.ok(manifest.files.includes('extension/status-publisher.mjs'));
+  assert.ok(manifest.files.includes('extension/commands.mjs'));
   assert.ok(manifest.files.includes('statusline/contributions.mjs'));
   assert.ok(manifest.files.every(path => !/\.local|test-artifacts|node_modules|copilot-sdk/.test(path)));
   const lock = await readJson(join(root, 'package-lock.json'));
@@ -63,7 +64,7 @@ test('CLI defaults to both components and explicit absolute destination, honorin
 test('fresh installation copies complete persistent runtime and wires an independent compositor', async () => {
   const target = await home();
   const result = await install(target);
-  assert.equal(result.filesChanged, 8);
+  assert.equal(result.filesChanged, 9);
   assert.equal(result.backup, undefined);
   assert.deepEqual((await readdir(extension(target))).sort(), [...extensionNames].sort());
   assert.deepEqual((await readdir(compositor(target))).sort(), [...compositorNames].sort());

@@ -13,7 +13,7 @@ import { validateConfig as validateCompositor, expandCommand } from '../statusli
 const script = fileURLToPath(import.meta.url);
 const packageRoot = dirname(dirname(script));
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
-const extensionFiles = ['status-publisher.mjs', 'bridge.mjs', 'extension.mjs'];
+const extensionFiles = ['status-publisher.mjs', 'bridge.mjs', 'commands.mjs', 'extension.mjs'];
 const compositorFiles = ['contributions.mjs', 'statusline.mjs'];
 
 export function options(args, env = process.env) {

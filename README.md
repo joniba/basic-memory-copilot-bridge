@@ -133,7 +133,25 @@ there is no byte fallback. Compaction resets context baselines, and a missed
 pre-compaction opportunity does not schedule a recovery capture afterward.
 Capture before every compaction is not guaranteed.
 
-Edit the installed `config.json`, not the checkout. Capture and bounded debug
+The extension also registers a native `/bm-bridge` command, without starting an
+agent turn. It follows the CLI's normal command availability rules and is not
+marked for execution during an active agent turn:
+
+```text
+/bm-bridge
+/bm-bridge interval 100
+```
+
+The first command shows the current interval. The second saves **100,000 tokens**
+as `periodicMinimumNewTokens` in the installed config. Use a positive integer
+in thousands; `interval 50` restores the default. This is a **machine-wide**
+setting for sessions sharing the same Copilot home and persists across restarts
+and reinstalls. The issuing session refreshes its checkpoint forecast; other
+sessions adopt the setting on their next native event. Existing checkpoint
+history, progress toward the next opportunity, accepted requests, time cooldown
+and pressure rules are unchanged.
+
+You can also edit the installed `config.json`, not the checkout. Capture and bounded debug
 logging are enabled by default. Set `enabled: false` to stop new automatic offers.
 
 ## Optional token status line
