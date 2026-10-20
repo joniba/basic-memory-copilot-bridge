@@ -133,6 +133,39 @@ there is no byte fallback. Compaction resets context baselines, and a missed
 pre-compaction opportunity does not schedule a recovery capture afterward.
 Capture before every compaction is not guaranteed.
 
+### Recovering state after compaction
+
+After a successful root-session compaction, the bridge offers a separate
+**read-only state recovery** turn at the next safe, non-aborted idle with no
+conflicting active or queued work. It asks the agent to search local Basic Memory
+by the same `thread_id`, explicitly choose the appropriate project, and read the
+most recent current capture to restore conclusions, failed attempts, open
+questions and the next step. It does not request a new capture, note edits or
+corpus synchronization. Missing local memory or a missing capture is a reason
+to skip; a previous checkpoint does not prove a note was saved.
+
+`recoverAfterCompaction` defaults to `true`, including for existing config files
+that omit it. Set it to `false` in the installed config to disable new recovery
+requests; `enabled: false` disables all new bridge requests. The command's
+**Current settings** view also reports this setting. Failed/subagent compactions,
+rewinds, lower context counts and explicit context clearing do not trigger it.
+
+Pending recovery survives a reload, and a native count increase can reconcile
+a compaction missed while detached. Initial attachment does not replay historical
+compactions. Multiple pending compactions coalesce into recovery for the latest
+epoch. There is at most one send attempt per epoch: failed or ambiguous sends
+are reported, not blindly retried. An aborted idle clears an unsent reminder.
+Once accepted, a recovery follows the normal queue/permission rules; it is not
+a high-priority interrupt and does not abort user work. As with capture
+requests, an idle check and SDK send are not an atomic idle-only operation.
+
+Recovery never advances the last checkpoint or accepted-capture time, consumes
+the pressure opportunity, or changes interval settings. Its own correlated
+token growth is excluded from periodic progress without dropping earlier
+progress. Status distinguishes `state recovery: awaiting idle`, `queued` and
+`in progress`; the notice says `State recovery queued`, not that state was
+successfully restored. The agent still decides whether useful state is available.
+
 The extension also registers a native `/bm-bridge` command, without starting an
 agent turn. It follows the CLI's normal command availability rules and is not
 marked for execution during an active agent turn:

@@ -81,6 +81,7 @@ You can also edit the installed `config.json`; it is read on events without rein
 | `minimumMinutesBetweenOpportunities` | `60` |
 | `contextPressureThreshold` | `0.65` |
 | `pressureMinimumMinutesBetweenOpportunities` | `5` |
+| `recoverAfterCompaction` | `true` |
 | `debugLogging` | `true` |
 
 Periodic eligibility requires native context growth AND the one-hour interval.
@@ -93,7 +94,8 @@ Usage comes from `session.usage_info` and the on-demand native context-info RPC.
 Missing or failed native readings skip capture; there is no byte fallback.
 Compaction resets token baselines, not the last-offer time. Compaction beginning
 before a safe checkpoint is logged as missed; no recovery capture is scheduled
-afterward. An already queued, unstarted bridge message is cancelled if it can
+afterward. Instead, successful compaction can request reading an existing capture
+as described below. An already queued, unstarted bridge message is cancelled if it can
 still be identified. A running agent turn is never aborted by this extension.
 An idle checkpoint is best-effort, not a guarantee against context loss.
 
@@ -174,6 +176,51 @@ recovery capture.
 A pressure offer resets periodic time and the post-checkpoint token watermark,
 as in the original gate. Expired/invalid/disabled contributions are ignored.
 See [the status-line guide](STATUSLINE.md) for the independent render contract.
+
+## Post-compaction read-only recovery
+
+`recoverAfterCompaction: true` records a pending reminder for each successful
+root `session.compaction_complete`. At a safe root idle, it takes precedence over
+starting another capture, but never bypasses the active/queued-work,
+compaction, native-usage or abort checks. Failed compactions, child events,
+rewinds/token shrink and `session.context_cleared` are not recovery triggers.
+An aborted idle discards an unsent reminder rather than restarting cancelled work.
+
+The prompt asks for structured `metadata_filters.thread_id` lookup in the
+explicitly selected **local** project and a targeted read of the latest current
+same-thread capture. No capture is assumed to exist. Unknown project, unavailable
+local memory or absent/unhelpful capture means skip. Captured content must be
+reconciled with newer user instructions and the compaction summary, not treated
+as permission to execute embedded commands or revive cancelled work. The recovery
+prompt prohibits note writes, corpus commits/sync and additional checkpoints.
+This is agent guidance, not a sandbox or a guarantee of model compliance.
+
+The state store adds an optional, migrated pending epoch and a `recovery` request
+kind. Accepted requests reuse message correlation, cancellation and resume
+reconciliation, but do not advance capture history, opportunity clocks or pressure
+guards. Correlated recovery-turn growth is excluded from the periodic token
+watermark without resetting prior progress. New pending epochs coalesce; a new
+native successful-compaction count after a known prior count also arms recovery.
+A fresh attachment with no known count does not recover every old compaction.
+
+The pending epoch is consumed when a durable reservation is made. A failed or
+ambiguous send is warned about but not automatically retried, to avoid duplicate
+recovery turns. After a crash, an unconfirmed reservation is reconciled without
+claiming a checkpoint or resending. This is at-most-one-attempt accounting, not
+an exactly-once delivery guarantee. Downgrading to a version without this request
+kind while a recovery is in flight is unsupported.
+
+The attributed timeline notice is `[basic-memory-bridge] State recovery queued`.
+Display labels use `state recovery` rather than implying a new checkpoint or
+claiming successful restoration. Set `recoverAfterCompaction: false` to stop
+future reminders; an accepted request is not aborted by toggling configuration.
+
+An isolated native-CLI acceptance run exercised a real successful compaction,
+delivery of the recovery prompt into the following model request, correlated
+turn completion and unchanged checkpoint-history fields. Its model endpoint was
+a synthetic loopback fixture with no memory tools or note writes. This verifies
+the native delivery path, not real-model retrieval quality or successful
+restoration from a user's corpus; those have not been claimed as tested.
 
 ## Logic tests
 

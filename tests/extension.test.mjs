@@ -8,6 +8,7 @@ import {
   applyUsage, CaptureBridge, checkpointPrompt, createLogger, defaults,
   eligibility, FileStateStore, freshState, validateConfig,
   statusContribution,
+  recoveryPrompt,
 } from '../extension/bridge.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -303,7 +304,7 @@ test('cutover imports only the previous offer time, not byte watermarks', async 
 
 for (const config of [null, [], { typo: true }, { periodicMinimumNewTokens: -1 },
   { contextPressureThreshold: 0 }, { contextPressureThreshold: 1.1 }, { debugLogging: 'true' },
-  { minimumMinutesBetweenOpportunities: Infinity }]) {
+  { minimumMinutesBetweenOpportunities: Infinity }, { recoverAfterCompaction: 'true' }]) {
   test(`invalid config rejects ${JSON.stringify(config)}`, () => assert.throws(() => validateConfig(config)));
 }
 
@@ -471,14 +472,17 @@ test('native receipt reconciles an accepted request whose state acknowledgement 
   assert.equal((await f.state()).captureInFlight, null);
 });
 
-test('compaction records missed opportunity and does not replay a recovery checkpoint', async () => {
+test('compaction records a missed checkpoint and queues a distinct read-only recovery', async () => {
   const f = await fixture();
   await f.event('session.usage_info', { currentTokens: 70000, tokenLimit: 100000 });
   await f.event('session.compaction_start');
   await f.event('session.compaction_complete', { success: true });
   f.info({ totalTokens: 10000, limit: 100000 });
   await f.idle();
-  assert.equal(f.sent.length, 0);
+  assert.equal(f.sent.length, 1);
+  assert.match(f.sent[0].displayPrompt, /^Basic Memory recovery:/);
+  assert.equal((await f.state()).lastOpportunityAt, null);
+  assert.equal((await f.state()).lastCheckpointAt, null);
   assert.equal((await f.state()).compactionEpoch, 1);
   assert.equal((await f.state()).baselineTokens, 10000);
   assert.ok(f.logs.some(row => row.gateDecision === 'missed-pre-compaction'));
@@ -495,7 +499,7 @@ test('only own queued checkpoint is cancelled when compaction starts', async () 
 });
 
 test('high post-compaction context cannot replay a pressure checkpoint without new activity', async () => {
-  const f = await fixture();
+  const f = await fixture({ recoverAfterCompaction: false });
   await f.event('session.compaction_start');
   await f.event('session.compaction_complete', { success: true });
   f.info({ totalTokens: 70000, limit: 100000 });
@@ -526,6 +530,237 @@ test('native RPC failure skips capture and recovers when readings return', async
   f.session.rpc.metadata.contextInfo = async () => ({ contextInfo: { totalTokens: 51000, limit: 200000 } });
   await f.idle();
   assert.equal(f.sent.length, 1);
+});
+
+test('successful compaction defers one recovery to safe idle and leaves checkpoint accounting unchanged', async () => {
+  const f = await fixture();
+  await f.store.transaction(state => {
+    state.lastOpportunityAt = start - 1000;
+    state.lastCheckpointAt = start - 500;
+    state.lastCheckpointTokens = 90000;
+    state.pressureOpportunityEpoch = 0;
+  });
+  await f.event('session.compaction_complete', { success: true });
+  const pending = await f.state();
+  assert.equal(f.sent.length, 0);
+  assert.equal(pending.pendingRecoveryEpoch, 1);
+  assert.match(f.statuses.at(-1).label, /state recovery: awaiting idle/);
+  f.info({ totalTokens: 10000, limit: 100000 });
+  f.active(true);
+  await f.idle();
+  assert.equal(f.sent.length, 0);
+  f.active(false);
+  f.pending([{ id: 'user-work', messageId: 'human-message' }]);
+  await f.idle();
+  assert.equal(f.sent.length, 0);
+  f.pending([]);
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].source, 'system');
+  assert.equal(f.sent[0].mode, 'enqueue');
+  const queued = await f.state();
+  assert.equal(queued.pendingRecoveryEpoch, null);
+  assert.equal(queued.captureInFlight.kind, 'recovery');
+  assert.equal(queued.lastCheckpointAt, pending.lastCheckpointAt);
+  assert.equal(queued.lastOpportunityAt, pending.lastOpportunityAt);
+  assert.equal(queued.lastCheckpointTokens, pending.lastCheckpointTokens);
+  assert.equal(queued.pressureOpportunityEpoch, pending.pressureOpportunityEpoch);
+  assert.equal(f.statuses.at(-1).prefix, 'last checkpoint: 90K, state recovery: ');
+  assert.equal(f.statuses.at(-1).label, 'queued');
+  assert.equal(f.warnings.at(-1).message, '[basic-memory-bridge] State recovery queued');
+  await f.event('user.message', { messageId: 'message-1' });
+  assert.equal(f.statuses.at(-1).label, 'in progress');
+  f.info({ totalTokens: 80000, limit: 100000 });
+  await f.idle();
+  const finished = await f.state();
+  assert.equal(finished.captureInFlight, null);
+  assert.equal(finished.baselineTokens, 80000);
+  assert.equal(finished.lastOpportunityAt, pending.lastOpportunityAt);
+  assert.equal(finished.lastCheckpointAt, pending.lastCheckpointAt);
+  assert.equal(finished.lastCheckpointTokens, pending.lastCheckpointTokens);
+  assert.equal(finished.pressurePending, false);
+  await f.idle();
+  assert.equal(f.sent.length, 1, 'Recovery-generated growth must not start a new checkpoint.');
+});
+
+test('recovery prompt uses the exact same-thread local lookup and prohibits note mutation', () => {
+  const prompt = recoveryPrompt('recovery-session');
+  assert.match(prompt, /metadata_filters.thread_id = "copilot:recovery-session"/);
+  assert.match(prompt, /most recent existing Basic Memory capture/);
+  assert.match(prompt, /read-only recovery/);
+  assert.match(prompt, /do not create, update, move or delete notes/);
+  assert.match(prompt, /newer conversation instructions/);
+  assert.match(prompt, /skip recovery/);
+  assert.throws(() => recoveryPrompt('../other'), /session-invalid/);
+});
+
+test('duplicate compaction completion and reload do not duplicate a recovery request', async () => {
+  const f = await fixture();
+  const id = 'successful-compaction';
+  await f.event('session.compaction_complete', { success: true }, { id });
+  f.compactions(1);
+  await f.reload();
+  assert.equal((await f.state()).pendingRecoveryEpoch, 1);
+  f.info({ totalTokens: 10000, limit: 100000 });
+  await f.idle();
+  f.pending([{ id: 'recovery-item', messageId: 'message-1' }]);
+  await f.reload();
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  await f.event('session.compaction_complete', { success: true }, { id });
+  f.pending([]);
+  await f.event('user.message', { messageId: 'message-1' });
+  await f.idle();
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).compactionEpoch, 1);
+});
+
+test('failed compaction, child compaction, context clear and lower native counts do not request recovery', async () => {
+  for (const event of [
+    ['session.compaction_complete', { success: false }, {}],
+    ['session.compaction_complete', { success: true }, { agentId: 'child' }],
+    ['session.context_cleared', {}, {}],
+  ]) {
+    const f = await fixture();
+    await f.event(...event);
+    f.info({ totalTokens: 500, limit: 100000 });
+    await f.idle();
+    assert.equal(f.sent.length, 0);
+    assert.equal((await f.state()).pendingRecoveryEpoch, null);
+  }
+});
+
+test('disabled recovery still permits normal periodic captures and clears unsent reminders', async () => {
+  const f = await fixture({ recoverAfterCompaction: false });
+  await f.event('session.compaction_complete', { success: true });
+  f.info({ totalTokens: 10000, limit: 200000 });
+  await f.idle();
+  assert.equal(f.sent.length, 0);
+  f.info({ totalTokens: 60000, limit: 200000 });
+  await f.idle();
+  assert.match(f.sent[0].displayPrompt, /^Basic Memory checkpoint:/);
+  const paused = await fixture();
+  await paused.event('session.compaction_complete', { success: true });
+  paused.config({ enabled: false });
+  await paused.idle();
+  assert.equal((await paused.state()).pendingRecoveryEpoch, null);
+  assert.equal(paused.sent.length, 0);
+});
+
+test('aborted idle cancels the unsent recovery instead of reviving work after cancellation', async () => {
+  const f = await fixture();
+  await f.event('session.compaction_complete', { success: true });
+  await f.idle(true);
+  await f.idle();
+  assert.equal(f.sent.length, 0);
+  assert.equal((await f.state()).pendingRecoveryEpoch, null);
+});
+
+test('failed recovery send is reported once per compaction without consuming capture clocks', async () => {
+  const f = await fixture();
+  await f.event('session.compaction_complete', { success: true });
+  let attempts = 0;
+  f.session.send = async () => { attempts += 1; throw new Error('private recovery failure'); };
+  await f.idle();
+  await f.idle();
+  assert.equal(attempts, 1);
+  const state = await f.state();
+  assert.equal(state.lastOpportunityAt, null);
+  assert.equal(state.lastCheckpointAt, null);
+  assert.equal(state.retryAfter, null);
+  assert.equal(state.pendingRecoveryEpoch, null);
+  assert.match(f.warnings.at(-1).message, /recovery-send failed/);
+  assert.ok(!JSON.stringify(f.warnings).includes('private recovery'));
+});
+
+test('a pending checkpoint is reconciled before admitting post-compaction recovery', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 51000, limit: 200000 });
+  await f.idle();
+  await f.event('user.message', { messageId: 'message-1' });
+  await f.event('session.compaction_complete', { success: true });
+  f.info({ totalTokens: 10000, limit: 200000 });
+  await f.idle();
+  assert.equal(f.sent.length, 2);
+  assert.equal((await f.state()).captureInFlight.kind, 'recovery');
+});
+
+test('legacy state without recovery metadata migrates without discarding history', async () => {
+  const f = await fixture();
+  const state = await f.state();
+  delete state.pendingRecoveryEpoch;
+  state.lastCheckpointTokens = 198000;
+  state.lastCheckpointAt = start - 1000;
+  await writeFile(f.store.path, JSON.stringify(state));
+  await f.reload();
+  assert.equal((await f.state()).pendingRecoveryEpoch, null);
+  assert.equal((await f.state()).lastCheckpointTokens, 198000);
+  assert.equal((await f.state()).lastCheckpointAt, start - 1000);
+  assert.equal(f.sent.length, 0);
+});
+
+test('recovery excludes its own growth while retaining genuine progress accrued before its turn', async () => {
+  const f = await fixture();
+  await f.event('session.compaction_complete', { success: true });
+  f.active(true);
+  f.info({ totalTokens: 10000, limit: 200000 });
+  await f.idle();
+  f.info({ totalTokens: 20000, limit: 200000 });
+  f.active(false);
+  await f.idle();
+  await f.event('user.message', { messageId: 'message-1' });
+  f.info({ totalTokens: 30000, limit: 200000 });
+  await f.idle();
+  const state = await f.state();
+  assert.equal(state.lastContextTokens - state.baselineTokens, 10000);
+  assert.equal(state.lastOpportunityAt, null);
+  assert.equal(state.lastCheckpointAt, null);
+});
+
+test('multiple pending compactions coalesce and a new compaction during recovery permits only the newer recovery', async () => {
+  const f = await fixture();
+  await f.event('session.compaction_complete', { success: true }, { id: 'first' });
+  await f.event('session.compaction_complete', { success: true }, { id: 'second' });
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).captureInFlight.epoch, 2);
+  await f.event('user.message', { messageId: 'message-1' });
+  await f.event('session.compaction_complete', { success: true }, { id: 'third' });
+  await f.idle();
+  assert.equal(f.sent.length, 2);
+  assert.equal((await f.state()).captureInFlight.epoch, 3);
+  assert.equal((await f.state()).lastCheckpointAt, null);
+});
+
+test('accepted recovery survives an acknowledgement persistence failure without claiming a checkpoint', async () => {
+  const f = await fixture();
+  await f.event('session.compaction_complete', { success: true });
+  const transaction = f.store.transaction.bind(f.store);
+  let writes = 0;
+  f.store.transaction = action => ++writes === 2 ? Promise.reject(new Error('synthetic acknowledgement failure')) : transaction(action);
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  await f.event('user.message', { source: 'system', messageId: 'message-1', content: f.sent[0].displayPrompt });
+  await f.idle();
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).lastOpportunityAt, null);
+  assert.equal((await f.state()).lastCheckpointAt, null);
+});
+
+test('a new compaction racing recovery admission cancels the unsent recovery without a checkpoint notice', async () => {
+  const f = await fixture();
+  await f.event('session.compaction_complete', { success: true });
+  f.session.rpc.metadata.activity = async () => {
+    void f.event('session.compaction_start');
+    return { hasActiveWork: false };
+  };
+  await f.idle();
+  assert.equal(f.sent.length, 0);
+  assert.equal((await f.state()).captureInFlight, null);
+  assert.equal(f.warnings.length, 0);
+  assert.ok(f.logs.some(row => row.gateDecision === 'recovery-deferred-compaction'));
 });
 
 test('failed initialization does not prompt until it can establish the native baseline', async () => {
@@ -611,7 +846,9 @@ test('reload observes compaction missed while detached and resets epoch', async 
   assert.equal((await f.state()).compactionEpoch, 1);
   assert.equal((await f.state()).baselineTokens, 10000);
   await f.idle();
-  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent.length, 2);
+  assert.match(f.sent.at(-1).displayPrompt, /^Basic Memory recovery:/);
+  assert.equal((await f.state()).lastOpportunityAt, start);
 });
 
 test('context cleared resets baseline and preserves stable thread identity', async () => {
