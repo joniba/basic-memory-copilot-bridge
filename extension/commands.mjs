@@ -14,6 +14,7 @@ const help = [
   'Scope: shared by all sessions using this bridge installation; saved across restarts.',
   'Session overrides, reset and --global are not supported in this version.',
   'Only periodic token growth changes. Time cooldowns, pressure rules and checkpoint history stay unchanged.',
+  'Post-compaction recovery reads existing captures; configure recoverAfterCompaction to enable or disable it.',
   'Checkpoints still wait for safe idle. Other sessions adopt updates on their next native event.',
   'Type /bm-bridge and press Enter for the menu. Inline argument suggestions are not available.',
 ].join('\n');
@@ -185,6 +186,7 @@ export function bridgeCommand(path, getBridge) {
         await notify([
           `Machine-wide periodic interval: ${config.periodicMinimumNewTokens / 1000}K tokens; minimum time: ${config.minimumMinutesBetweenOpportunities}m.`,
           `Automatic checkpoints: ${config.enabled ? 'enabled' : 'disabled'}. Pressure: ${config.contextPressureThreshold * 100}%; minimum time: ${config.pressureMinimumMinutesBetweenOpportunities}m; once per compaction epoch.`,
+          `Post-compaction state recovery: ${config.recoverAfterCompaction ? 'enabled' : 'disabled'} (read existing captures at safe idle).`,
           '', help,
         ].join('\n'));
         return;

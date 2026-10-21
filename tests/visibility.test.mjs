@@ -38,6 +38,22 @@ test('idle hint uses earliest token target and white independent foreground', ()
     `tokens: 500K (${white('50%')}) ${white('last checkpoint: none, next checkpoint: 505K')}`);
 });
 
+test('recovery status preserves historical checkpoint text without claiming another checkpoint', () => {
+  const state = stateAt();
+  state.lastCheckpointTokens = 198000;
+  state.pendingRecoveryEpoch = state.compactionEpoch;
+  const pending = statusContribution(state, usage(500000), defaults);
+  assert.equal(tokenBadge(status(500000), [pending], now),
+    `tokens: 500K (${white('50%')}) ${white('last checkpoint: 198K, state recovery: awaiting idle')}`);
+  state.pendingRecoveryEpoch = null;
+  state.captureInFlight = { id: 'recovery', epoch: 0, kind: 'recovery', startTokens: 500000,
+    messageId: 'message', started: false };
+  assert.equal(tokenBadge(status(500000), [statusContribution(state, usage(500000), defaults)], now),
+    `tokens: 500K (${white('50%')}) ${white('last checkpoint: 198K, state recovery: ')}${yellow('queued')}`);
+  state.captureInFlight.started = true;
+  assert.equal(statusContribution(state, usage(500000), defaults).label, 'in progress');
+  assert.equal(state.lastCheckpointTokens, 198000);
+});
 test('pressure target wins when periodic threshold is farther away', () => {
   const state = stateAt(630000, 630000);
   const hint = statusContribution(state, usage(630000), defaults);

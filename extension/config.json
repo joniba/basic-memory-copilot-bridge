@@ -4,5 +4,6 @@
   "minimumMinutesBetweenOpportunities": 60,
   "contextPressureThreshold": 0.65,
   "pressureMinimumMinutesBetweenOpportunities": 5,
+  "recoverAfterCompaction": true,
   "debugLogging": true
 }

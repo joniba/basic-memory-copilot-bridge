@@ -153,6 +153,13 @@ exact compaction timing, and the label does not request immediate post-compactio
 capture. Labels describe checkpoint turns, not verified persistence. Publication failures fail open,
 and a lease expires instead of leaving a permanent activity indicator.
 
+Post-compaction reading is shown separately from checkpoint creation:
+`last checkpoint: 455K, state recovery: awaiting idle` (white), then the same
+historical prefix with a yellow `queued`/`in progress` suffix after admission
+and correlated start. It does not claim a capture was written or successfully
+read. Recovery completion restores the normal checkpoint forecast without
+changing the historical last-checkpoint value or opportunity cooldown.
+
 ### Publisher I/O recovery and diagnostics
 
 The publisher retries short exclusive-lock contention (`EEXIST`) without stealing
