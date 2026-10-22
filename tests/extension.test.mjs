@@ -29,6 +29,7 @@ async function fixture(overrides = {}, id = 'test-session') {
   let now = start;
   let info = { totalTokens: 1000, limit: 200000 };
   let active = false;
+  let processing = true;
   let compactions = 0;
   let pending = [];
   const session = {
@@ -41,6 +42,7 @@ async function fixture(overrides = {}, id = 'test-session') {
         contextInfo: async () => ({ contextInfo: info }),
         getContextAttribution: async () => ({ contextAttribution: { compactions: { count: compactions } } }),
         activity: async () => ({ hasActiveWork: active }),
+        isProcessing: async () => ({ processing }),
       },
       queue: {
         pendingItems: async () => ({ items: pending, steeringMessages: [] }),
@@ -61,6 +63,7 @@ async function fixture(overrides = {}, id = 'test-session') {
     time: value => { now = value; },
     config: value => { config = validateConfig(value); },
     active: value => { active = value; },
+    processing: value => { processing = value; },
     pending: value => { pending = value; },
     compactions: value => { compactions = value; },
     event: async (type, data = {}, extra = {}) => bridge.on({ type, data, id: `${type}-${now}`, ...extra }),
@@ -698,6 +701,88 @@ test('legacy state without recovery metadata migrates without discarding history
   assert.equal((await f.state()).lastCheckpointTokens, 198000);
   assert.equal((await f.state()).lastCheckpointAt, start - 1000);
   assert.equal(f.sent.length, 0);
+});
+
+test('manual compaction while already idle admits recovery without another user turn or idle event', async () => {
+  const f = await fixture();
+  f.processing(false);
+  await f.event('session.compaction_complete', { success: true });
+  assert.equal(f.sent.length, 1);
+  assert.match(f.sent[0].displayPrompt, /^Basic Memory recovery:/);
+  assert.equal((await f.state()).captureInFlight.kind, 'recovery');
+  assert.equal((await f.state()).pendingRecoveryEpoch, null);
+  assert.equal((await f.state()).lastOpportunityAt, null);
+  assert.ok(f.logs.some(row => row.event === 'bridge.recovery_check' && row.gateDecision === 'offered:recovery'));
+});
+
+test('post-compaction check never uses a model turn end as proof of idle', async () => {
+  const f = await fixture();
+  await f.event('session.compaction_complete', { success: true });
+  await f.event('assistant.turn_end');
+  assert.equal(f.sent.length, 0);
+  assert.equal((await f.state()).pendingRecoveryEpoch, 1);
+  assert.ok(f.logs.some(row => row.gateDecision === 'recovery-awaiting-idle'));
+  f.processing(false);
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+});
+
+test('already-idle check still yields to background tasks and queued foreground work', async () => {
+  for (const kind of ['active', 'queued']) {
+    const f = await fixture();
+    f.processing(false);
+    if (kind === 'active') f.active(true);
+    else f.pending([{ id: 'human-request', messageId: 'user-message' }]);
+    await f.event('session.compaction_complete', { success: true });
+    assert.equal(f.sent.length, 0);
+    assert.equal((await f.state()).pendingRecoveryEpoch, 1);
+    f.active(false);
+    f.pending([]);
+    await f.idle();
+    assert.equal(f.sent.length, 1);
+  }
+});
+
+test('resuming an unsent pending recovery while already idle does not need a new user prompt', async () => {
+  const f = await fixture();
+  await f.event('session.compaction_complete', { success: true });
+  f.compactions(1);
+  f.processing(false);
+  await f.reload();
+  assert.equal(f.sent.length, 1);
+  f.pending([{ id: 'accepted', messageId: 'message-1' }]);
+  await f.reload();
+  assert.equal(f.sent.length, 1);
+});
+
+test('failed or invalid native processing query retains recovery and cannot trigger a send', async () => {
+  for (const response of [null, { processing: 'false' }]) {
+    const f = await fixture();
+    f.session.rpc.metadata.isProcessing = async () => {
+      if (response === null) throw new Error('private-native-error');
+      return response;
+    };
+    await f.event('session.compaction_complete', { success: true });
+    assert.equal(f.sent.length, 0);
+    assert.equal((await f.state()).pendingRecoveryEpoch, 1);
+    assert.ok(f.logs.some(row => row.gateDecision === 'event-error'));
+    assert.ok(!JSON.stringify(f.warnings).includes('private-native-error'));
+    f.session.rpc.metadata.isProcessing = async () => ({ processing: false });
+    await f.idle();
+    assert.equal(f.sent.length, 1);
+  }
+});
+
+test('already-idle path honors cancellation, disabled recovery and repeated completion deduplication', async () => {
+  const f = await fixture();
+  await f.event('session.compaction_complete', { success: true }, { id: 'manual-event' });
+  await f.idle(true);
+  f.processing(false);
+  await f.event('session.compaction_complete', { success: true }, { id: 'manual-event' });
+  assert.equal(f.sent.length, 0);
+  f.config({ recoverAfterCompaction: false, periodicMinimumNewTokens: 0 });
+  await f.event('session.compaction_complete', { success: true }, { id: 'other-manual-event' });
+  assert.equal(f.sent.length, 0, 'The new check must not turn into a periodic checkpoint.');
 });
 
 test('recovery excludes its own growth while retaining genuine progress accrued before its turn', async () => {
