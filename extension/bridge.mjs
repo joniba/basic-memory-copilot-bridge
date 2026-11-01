@@ -400,7 +400,10 @@ export class CaptureBridge {
   }
 
   start() {
-    return this.enqueue(() => this.initialize());
+    return this.enqueue(async () => {
+      await this.initialize();
+      await this.checkRecoveryIdle();
+    });
   }
 
   async initialize() {
@@ -445,7 +448,26 @@ export class CaptureBridge {
   on(event) {
     if (event.agentId || this.stopped) return;
     if (event.type === 'session.compaction_start') this.compactionStarting = true;
-    return this.enqueue(() => this.handle(event));
+    return this.enqueue(async () => {
+      await this.handle(event);
+      if (event.type === 'session.compaction_complete' && event.data.success === true) {
+        await this.checkRecoveryIdle();
+      }
+    });
+  }
+
+  async checkRecoveryIdle() {
+    if (!this.ready || this.stopped || this.compactionStarting
+      || !this.lastState || this.lastState.pendingRecoveryEpoch === null || this.lastState.captureInFlight) return;
+    const config = await this.readConfig();
+    if (!config.enabled || !config.recoverAfterCompaction) return;
+    const { processing } = await bounded(this.session.rpc.metadata.isProcessing());
+    if (typeof processing !== 'boolean') throw new Error('processing-state-invalid');
+    if (processing) {
+      await this.report('bridge.recovery_check', 'recovery-awaiting-idle', config);
+      return;
+    }
+    await this.handle({ type: 'bridge.recovery_check', data: {} });
   }
 
   async refreshUsage() {
@@ -549,9 +571,9 @@ export class CaptureBridge {
       await this.report(event.type, 'shutdown', config);
       return;
     }
-    if (!['session.idle', 'user.message', 'session.compaction_start',
+    if (!['session.idle', 'bridge.recovery_check', 'user.message', 'session.compaction_start',
       'session.compaction_complete', 'session.context_cleared'].includes(event.type)) return;
-    if (event.type === 'session.idle') await this.refreshUsage();
+    if (event.type === 'session.idle' || event.type === 'bridge.recovery_check') await this.refreshUsage();
     let offer;
     await this.transaction(async (state, recovered) => {
       if (this.usage && !state.compacting) applyUsage(state, this.usage, config);
@@ -647,6 +669,7 @@ export class CaptureBridge {
       const decision = config.enabled && state.pendingRecoveryEpoch !== null && !state.compacting
         && (state.retryAfter === null || this.clock() >= state.retryAfter)
         ? 'recovery' : eligibility(state, config, this.clock());
+      if (event.type === 'bridge.recovery_check' && decision !== 'recovery') return;
       if (!['periodic', 'pressure', 'recovery'].includes(decision) || this.compactionStarting) {
         await this.report(event.type, this.compactionStarting ? 'compacting' : decision, config);
         return;
