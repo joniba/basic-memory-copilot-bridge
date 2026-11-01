@@ -181,6 +181,13 @@ questions and the next step. It does not request a new capture, note edits or
 corpus synchronization. Missing local memory or a missing capture is a reason
 to skip; a previous checkpoint does not prove a note was saved.
 
+Manual compaction can finish while the session is already idle without emitting
+another idle event. After successful compaction (and when resuming an unsent
+reminder), the bridge therefore checks the native processing state explicitly.
+If no message/continuation is processing, it rechecks activity and pending queues
+before admitting recovery. A busy session still waits for its normal root idle;
+an individual assistant turn ending is not treated as sufficient.
+
 `recoverAfterCompaction` defaults to `true`, including for existing config files
 that omit it. Set it to `false` in the installed config to disable new recovery
 requests; `enabled: false` disables all new bridge requests. The command's

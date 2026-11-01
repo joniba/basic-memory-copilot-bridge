@@ -177,16 +177,32 @@ changing the historical last-checkpoint value or opportunity cooldown.
 
 ### Publisher I/O recovery and diagnostics
 
-The publisher retries short exclusive-lock contention (`EEXIST`) without stealing
-or deleting an existing lock. On Windows it also retries sharing/access conflicts
+On Windows, each write holds an exclusive named-pipe endpoint derived from the
+canonical status-file path. This is an operating-system-owned lock, not a
+network service or another MCP server: incoming connections are immediately
+closed and no payload is exchanged. Windows releases the endpoint if its owner
+exits, even if JavaScript cleanup does not run. Publication therefore cannot be
+blocked by the old zero-byte `.json.lock` marker left by an exited process.
+Old markers are ignored and left untouched, not deleted or stolen by age.
+
+Live Windows lock contention reports `lock-acquire/EADDRINUSE` and is retried.
+Other platforms retain exclusive lock files (`EEXIST`); this change does not
+claim crash-safe lock recovery on those platforms or for checkpoint-state and
+installer locks. On Windows the publisher also retries sharing/access conflicts
 (`EPERM`, `EACCES`, `EBUSY`) while reading the owner record, replacing the JSON file,
-or removing its own temporary/lock files. There are at most six attempts with
+or removing its own temporary files. There are at most six attempts with
 25, 50, 100, 200 and 400 ms waits: no indefinite retry or stale-lock takeover.
 Permanent directory, capacity and invalid-payload errors fail explicitly.
 An initial claim records the owner it observed before waiting for the lock;
 if another process takes ownership meanwhile, the waiting publisher stops
 instead of overwriting the newer signal. The same check protects a heartbeat
 retry after a failed first publication.
+
+The JSON envelope, file location, leases and owner handoff checks are unchanged.
+Use the normal owning-session reload to replace an old publisher with the new
+one; old and new lock protocols must not be run concurrently for the same status
+file. Already-running sessions on other status files are unaffected by a disk
+update, and must load the new code before gaining the crash-safe lock.
 
 Heartbeat renewal always uses the latest requested status, including an update
 that previously failed to reach disk. A failed clear stops renewing old activity,

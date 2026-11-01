@@ -182,7 +182,13 @@ without prompts, tool contents, paths, or error text. Atomic publication and a
 30-second lease, renewed every ten seconds, prevent stale activity after a
 process exits; a superseded process cannot clear the newer owner's signal.
 Short status-file sharing/lock conflicts are retried within a bounded window,
-without removing another writer's lock. Sanitized operation/error-code diagnostics
+without removing another writer's lock. Windows status publication uses a
+short-lived, exclusive named pipe as its lock. Windows releases it when the
+writer exits, preventing an abandoned marker from blocking future sessions.
+Legacy status lock files are ignored and left untouched. This changes only
+status-publication locking, not checkpoint-state, configuration or installer
+locks. Other platforms retain the existing file-lock behavior.
+Sanitized operation/error-code diagnostics
 distinguish replacement, lock and cleanup failures. Heartbeats retain the latest
 requested display intent; failed clears let old activity expire instead of
 renewing it indefinitely. See the status-line guide for recovery limits.
@@ -217,6 +223,16 @@ starting another capture, but never bypasses the active/queued-work,
 compaction, native-usage or abort checks. Failed compactions, child events,
 rewinds/token shrink and `session.context_cleared` are not recovery triggers.
 An aborted idle discards an unsent reminder rather than restarting cancelled work.
+
+Successful compaction also performs a bounded native `metadata.isProcessing`
+check. This handles manual compaction issued while already idle, where no new
+`session.idle` transition is guaranteed. The same check runs after initialization
+when an unsent reminder was preserved. If processing is false, an internal
+`bridge.recovery_check` refreshes usage and reuses the activity/queue admission
+guards; it may only admit recovery, never a periodic/pressure capture. Processing,
+invalid/unavailable state, active tasks or pending user work prevent admission.
+The usual idle handler remains the fallback; no polling or turn-end shortcut is
+introduced. The idle-check/send race remains subject to the existing SDK limits.
 
 The prompt asks for structured `metadata_filters.thread_id` lookup in the
 explicitly selected **local** project and a targeted read of the latest current

@@ -1,12 +1,13 @@
-import { randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, open, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
+import { basename, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const validName = value => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(value);
 const operations = new Set(['mkdir', 'lock-acquire', 'read-owner', 'write-temp', 'replace',
   'temp-cleanup', 'lock-close', 'lock-release', 'encode']);
-const errorCodes = new Set(['EACCES', 'EPERM', 'EBUSY', 'EEXIST', 'ENOENT', 'ENOSPC',
+const errorCodes = new Set(['EACCES', 'EPERM', 'EBUSY', 'EEXIST', 'EADDRINUSE', 'ENOENT', 'ENOSPC',
   'EIO', 'EMFILE', 'ENFILE', 'EROFS', 'ENOTDIR', 'EISDIR', 'EINVAL', 'EXDEV', 'INVALID', 'LIMIT']);
 const retryDelays = [25, 50, 100, 200, 400];
 const windowsSharingCodes = new Set(['EPERM', 'EACCES', 'EBUSY']);
@@ -32,7 +33,7 @@ async function fileOperation(operation, action, report) {
       return result;
     } catch (cause) {
       lastCode = errorCodes.has(cause?.code) ? cause.code : 'UNKNOWN';
-      const retryable = operation === 'lock-acquire' && lastCode === 'EEXIST'
+      const retryable = operation === 'lock-acquire' && ['EEXIST', 'EADDRINUSE'].includes(lastCode)
         || process.platform === 'win32' && sharingOperations.has(operation)
           && windowsSharingCodes.has(lastCode);
       if (retryable && attempt < retryDelays.length) {
@@ -124,6 +125,31 @@ export class StatusPublisher {
     return action;
   }
 
+  async acquireLock() {
+    if (process.platform !== 'win32') return open(`${this.path}.lock`, 'wx');
+    const key = createHash('sha256').update(join(await realpath(this.directory), basename(this.path)).toLowerCase()).digest('hex');
+    const pipe = `\\\\.\\pipe\\copilot-status-lock-${key}`;
+    const server = createServer(socket => socket.destroy());
+    return new Promise((resolve, reject) => {
+      const failed = error => {
+        server.removeListener('listening', ready);
+        reject(error);
+      };
+      const ready = () => {
+        server.removeListener('error', failed);
+        server.on('error', error => this.report({ operation: 'lock-acquire', code: error.code }));
+        server.unref();
+        resolve({
+          close: () => new Promise((done, failedClose) =>
+            server.close(error => error ? failedClose(error) : done())),
+        });
+      };
+      server.once('error', failed);
+      server.once('listening', ready);
+      server.listen(pipe);
+    });
+  }
+
   async write(contribution) {
     if (this.closed) return;
     await fileOperation('mkdir', () => mkdir(this.directory, { recursive: true }), this.report);
@@ -132,7 +158,7 @@ export class StatusPublisher {
       this.expectedOwner = typeof previous?.owner === 'string' ? previous.owner : null;
     }
     const lockPath = `${this.path}.lock`;
-    const lock = await fileOperation('lock-acquire', () => open(lockPath, 'wx'), this.report);
+    const lock = await fileOperation('lock-acquire', () => this.acquireLock(), this.report);
     let temporary;
     try {
       const previous = await this.readRecord();
@@ -166,7 +192,9 @@ export class StatusPublisher {
         if (temporary) await fileOperation('temp-cleanup', () => unlink(temporary), this.report);
       } finally {
         await fileOperation('lock-close', () => lock.close(), this.report);
-        await fileOperation('lock-release', () => unlink(lockPath), this.report);
+        if (process.platform !== 'win32') {
+          await fileOperation('lock-release', () => unlink(lockPath), this.report);
+        }
       }
     }
   }
