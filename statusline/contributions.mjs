@@ -6,15 +6,21 @@ const count = value => Number.isSafeInteger(value) && value >= 0;
 const validName = value => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(value);
 const text = value => typeof value === 'string' && value.length > 0 && value.length <= 160
   && !/[\x00-\x1f\x7f]/.test(value);
+const validAnnotation = value => value === undefined || (object(value) && text(value.text)
+  && value.text.length <= 40 && ['white', 'yellow', 'red'].includes(value.color));
+const annotationFields = value => value === undefined ? {} : {
+  annotation: { text: value.text, color: value.color },
+};
 
 export function validContribution(value) {
   if (!object(value) || !['activity', 'hint'].includes(value.kind)
     || !['white', 'yellow', 'red'].includes(value.color)
-    || !count(value.priority) || value.priority > 100) return false;
+    || !count(value.priority) || value.priority > 100 || !validAnnotation(value.annotation)) return false;
   if (value.kind === 'activity') return text(value.label)
     && (value.prefix === undefined || text(value.prefix));
   return Array.isArray(value.targets) && value.targets.length > 0 && value.targets.length <= 8
-    && value.targets.every(target => object(target) && count(target.tokens) && count(target.notBefore))
+    && value.targets.every(target => object(target) && count(target.tokens) && count(target.notBefore)
+      && validAnnotation(target.annotation))
     && object(value.labels) && ['tokens', 'time', 'ready'].every(key => text(value.labels[key]))
     && (value.tokenCeiling === undefined
       || (count(value.tokenCeiling) && value.tokenCeiling > 0 && text(value.labels.beyond)));
@@ -57,17 +63,21 @@ export function contributionLabel(contribution, tokens, now) {
   if (!validContribution(contribution)) return null;
   if (contribution.kind === 'activity') return {
     text: contribution.label, color: contribution.color,
+    ...annotationFields(contribution.annotation),
     ...(contribution.prefix === undefined ? {} : { prefix: contribution.prefix }),
   };
   if (!count(tokens)) return null;
   const targets = contribution.targets.filter(target => contribution.tokenCeiling === undefined
     || target.tokens < contribution.tokenCeiling || tokens >= target.tokens);
-  if (!targets.length) return { text: contribution.labels.beyond, color: contribution.color };
+  if (!targets.length) return { text: contribution.labels.beyond, color: contribution.color,
+    ...annotationFields(contribution.annotation) };
   const reached = targets.filter(target => tokens >= target.tokens);
   let label;
+  let selected;
   if (reached.length) {
     const nextTime = Math.min(...reached.map(target => target.notBefore));
     const target = Math.min(...reached.filter(target => target.notBefore === nextTime).map(target => target.tokens));
+    selected = reached.find(value => value.notBefore === nextTime && value.tokens === target);
     const amount = target < 1000 ? String(target) : `${Math.ceil(target / 1000)}K`;
     label = nextTime > now
       ? contribution.tokenCeiling !== undefined && tokens >= contribution.tokenCeiling
@@ -76,8 +86,10 @@ export function contributionLabel(contribution, tokens, now) {
       : contribution.labels.ready.replaceAll('{tokens}', amount);
   } else {
     const target = Math.min(...targets.map(target => target.tokens));
+    selected = targets.find(value => value.tokens === target);
     const amount = target < 1000 ? String(target) : `${Math.ceil(target / 1000)}K`;
     label = contribution.labels.tokens.replaceAll('{tokens}', amount);
   }
-  return { text: label, color: contribution.color };
+  return { text: label, color: contribution.color,
+    ...annotationFields(contribution.annotation ?? selected.annotation) };
 }

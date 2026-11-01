@@ -116,6 +116,38 @@ substitute for testing a long-running interactive session.
 
 ## State, diagnostics, and disable
 
+### Integration cadence and pressure safeguard
+
+The bridge selects `memory-integrate` for every fifth completed checkpoint, with
+a persistent count across compaction and reload. The counter starts at zero for
+legacy state without this metadata, preserving existing history and time gates.
+An integration replaces a capture; it does not additionally create a session
+capture. Only a correlated, started, non-aborted checkpoint turn observed
+finishing increments the count. Reconciled unknown completions, cancelled
+requests and read-only recovery do not count.
+
+A completed integration marks the current compaction epoch as integrated, even
+if the agent reported no useful changes. This is turn-completion accounting,
+not verification that topic notes were updated. Manual integrations outside the
+bridge are not detectable by this rule. If the current epoch has no completed
+integration, usage at or above 70% can admit an extra integration checkpoint at
+safe idle, subject to the existing five-minute opportunity gap and all
+active/queued-work, usage, retry and compaction guards. This remains available
+after an earlier normal pressure checkpoint. Its accepted pressure attempt is
+recorded separately to prevent immediate repeated integrations after an abort.
+
+`completedCheckpoints`, `lastIntegrationEpoch` and
+`integrationPressureOpportunityEpoch` are bounded operational state, not note
+contents. Each checkpoint reservation freezes its `integration` action flag.
+The next target and active label carry a generic yellow `integration` annotation
+without changing the renderer's provider-independent scheduling contract.
+
+The integration prompt requires the installed topic-based `memory-integrate`
+skill, a correctly routed local project, canonical-note searches before edits,
+read-back verification and current write holds. Session provenance may be
+recorded, but the canonical thread key must not be duplicated across topic notes.
+The normal periodic interval command does not change either integration rule.
+
 Per-session files live under the Copilot home:
 
 ```text

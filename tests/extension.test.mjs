@@ -9,6 +9,7 @@ import {
   eligibility, FileStateStore, freshState, validateConfig,
   statusContribution,
   recoveryPrompt,
+  integrationCheckpoint,
 } from '../extension/bridge.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -101,10 +102,210 @@ test('accepted pressure opportunity resets periodic hint time and post-checkpoin
   f.info({ totalTokens: 132000, limit: 200000 });
   await f.idle();
   const hint = f.statuses.at(-1);
-  assert.equal(hint.targets.length, 1);
+  assert.equal(hint.targets.length, 2);
   assert.equal(hint.targets[0].tokens, 182000);
   assert.equal(hint.targets[0].notBefore, start + 3600000);
   assert.equal((await f.state()).lastOpportunityTokens, 132000);
+  assert.equal(hint.targets[1].tokens, 140000);
+  assert.deepEqual(hint.targets[1].annotation, { text: 'integration', color: 'yellow' });
+});
+
+test('every fifth completed checkpoint uses integration without recursively checkpointing its own turn', async () => {
+  const f = await fixture({ periodicMinimumNewTokens: 1000, minimumMinutesBetweenOpportunities: 0 });
+  let tokens = 1000;
+  for (let checkpoint = 1; checkpoint <= 10; checkpoint += 1) {
+    tokens += 1000;
+    f.info({ totalTokens: tokens, limit: 1000000 });
+    await f.idle();
+    const sent = f.sent.at(-1);
+    assert.equal((await f.state()).captureInFlight.integration, checkpoint % 5 === 0);
+    assert.match(sent.prompt, checkpoint % 5 === 0 ? /memory-integrate skill instead of memory-capture/ : /memory-capture skill/);
+    assert.match(sent.displayPrompt, checkpoint % 5 === 0 ? /^Basic Memory integration:/ : /^Basic Memory checkpoint:/);
+    await f.event('user.message', { messageId: `message-${checkpoint}` });
+    tokens += 2000;
+    f.info({ totalTokens: tokens, limit: 1000000 });
+    await f.idle();
+    assert.equal((await f.state()).completedCheckpoints, checkpoint);
+    if (checkpoint % 5 === 0) assert.equal((await f.state()).lastIntegrationEpoch, 0);
+    await f.idle();
+    assert.equal(f.sent.length, checkpoint);
+  }
+  assert.equal(f.warnings.filter(value => value.message === '[basic-memory-bridge] Memory integration queued').length, 2);
+});
+
+test('70 percent adds integration after the normal pressure opportunity and retains the five-minute gap', async () => {
+  const f = await fixture({ recoverAfterCompaction: false });
+  f.info({ totalTokens: 65000, limit: 100000 });
+  await f.idle();
+  assert.equal((await f.state()).captureInFlight.integration, false);
+  await f.event('user.message', { messageId: 'message-1' });
+  await f.idle();
+  f.info({ totalTokens: 70000, limit: 100000 });
+  f.time(start + 299999);
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  f.time(start + 300000);
+  await f.idle();
+  assert.equal(f.sent.length, 2);
+  assert.equal((await f.state()).captureInFlight.integration, true);
+  assert.equal((await f.state()).integrationPressureOpportunityEpoch, 0);
+  await f.event('user.message', { messageId: 'message-2' });
+  await f.idle();
+  assert.equal((await f.state()).lastIntegrationEpoch, 0);
+  assert.equal((await f.state()).completedCheckpoints, 2);
+  f.info({ totalTokens: 75000, limit: 100000 });
+  f.time(start + 600000);
+  await f.idle();
+  assert.equal(f.sent.length, 2);
+  await f.event('session.compaction_complete', { success: true });
+  f.info({ totalTokens: 10000, limit: 100000 });
+  await f.idle();
+  f.info({ totalTokens: 70000, limit: 100000 });
+  await f.idle();
+  assert.equal(f.sent.length, 3);
+  assert.equal((await f.state()).captureInFlight.integration, true);
+  assert.equal((await f.state()).completedCheckpoints, 2, 'Compaction must not reset the fifth-checkpoint cadence.');
+});
+
+test('a completed fifth-checkpoint integration before 70 percent satisfies that cycle safeguard', async () => {
+  const f = await fixture();
+  await f.store.transaction(state => { state.completedCheckpoints = 4; });
+  f.info({ totalTokens: 65000, limit: 100000 });
+  await f.idle();
+  assert.equal((await f.state()).captureInFlight.integration, true);
+  await f.event('user.message', { messageId: 'message-1' });
+  await f.idle();
+  f.info({ totalTokens: 70000, limit: 100000 });
+  f.time(start + 300000);
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).completedCheckpoints, 5);
+  assert.equal((await f.state()).lastIntegrationEpoch, 0);
+  assert.equal(integrationCheckpoint(await f.state()), false);
+});
+
+test('integration pressure uses the exact 70 percent boundary independently of the periodic interval', () => {
+  const state = Object.assign(freshState('boundary'), {
+    baselineTokens: 1000, lastOpportunityTokens: 65000, lastContextTokens: 69999,
+    tokenLimit: 100000, lastOpportunityAt: start - 600000, completedCheckpoints: 1,
+    pressurePending: true, pressureOpportunityEpoch: 0,
+  });
+  const config = validateConfig({ periodicMinimumNewTokens: 900000 });
+  assert.equal(eligibility(state, config, start), 'below-gate');
+  assert.equal(integrationCheckpoint(state), false);
+  state.lastContextTokens = 70000;
+  assert.equal(eligibility(state, config, start), 'pressure');
+  assert.equal(integrationCheckpoint(state), true);
+  state.lastIntegrationEpoch = state.compactionEpoch;
+  assert.equal(eligibility(state, config, start), 'below-gate');
+});
+
+test('the fifth-checkpoint action selection does not itself bypass the periodic or pressure eligibility gates', () => {
+  const state = Object.assign(freshState('fifth-not-due'), {
+    baselineTokens: 1000, lastContextTokens: 1001, tokenLimit: 100000,
+    completedCheckpoints: 4, pressurePending: false,
+  });
+  assert.equal(integrationCheckpoint(state), true);
+  assert.equal(eligibility(state, defaults, start), 'below-gate');
+});
+
+test('aborted integration does not count as completed and does not immediately repeat the pressure attempt', async () => {
+  const f = await fixture({ periodicMinimumNewTokens: 500000 });
+  f.info({ totalTokens: 70000, limit: 100000 });
+  await f.idle();
+  await f.event('user.message', { messageId: 'message-1' });
+  await f.idle(true);
+  const state = await f.state();
+  assert.equal(state.completedCheckpoints, 0);
+  assert.equal(state.lastIntegrationEpoch, null);
+  assert.equal(state.integrationPressureOpportunityEpoch, 0);
+  f.time(start + 600000);
+  f.info({ totalTokens: 75000, limit: 100000 });
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+});
+
+test('failed integration send retains the fifth checkpoint until the normal retry succeeds', async () => {
+  const f = await fixture();
+  await f.store.transaction(state => { state.completedCheckpoints = 4; });
+  f.info({ totalTokens: 51000, limit: 1000000 });
+  f.session.send = async () => { throw new Error('synthetic send failure'); };
+  await f.idle();
+  assert.equal((await f.state()).completedCheckpoints, 4);
+  assert.equal((await f.state()).lastIntegrationEpoch, null);
+  f.session.send = async options => { f.sent.push(options); return 'integration-message'; };
+  f.time(start + 60000);
+  await f.idle();
+  assert.equal((await f.state()).captureInFlight.integration, true);
+  await f.event('user.message', { messageId: 'integration-message' });
+  await f.idle();
+  assert.equal((await f.state()).completedCheckpoints, 5);
+});
+
+test('integration cadence survives reload and legacy state starts counting prospectively without losing history', async () => {
+  const f = await fixture();
+  await f.store.transaction(state => {
+    state.completedCheckpoints = 4;
+    state.lastIntegrationEpoch = 0;
+    state.lastCheckpointTokens = 198000;
+    state.lastCheckpointAt = start - 1000;
+  });
+  await f.reload();
+  assert.equal((await f.state()).completedCheckpoints, 4);
+  f.info({ totalTokens: 51000, limit: 1000000 });
+  await f.idle();
+  assert.equal((await f.state()).captureInFlight.integration, true);
+  const legacy = await fixture();
+  const state = await legacy.state();
+  delete state.completedCheckpoints;
+  delete state.lastIntegrationEpoch;
+  delete state.integrationPressureOpportunityEpoch;
+  state.lastCheckpointTokens = 198000;
+  state.lastCheckpointAt = start - 1000;
+  await writeFile(legacy.store.path, JSON.stringify(state));
+  await legacy.reload();
+  assert.equal((await legacy.state()).completedCheckpoints, 0);
+  assert.equal((await legacy.state()).lastCheckpointTokens, 198000);
+  assert.equal((await legacy.state()).lastCheckpointAt, start - 1000);
+});
+
+test('integration pressure yields to active user work and does not override disable or compaction guards', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 70000, limit: 100000 });
+  f.active(true);
+  await f.idle();
+  f.active(false);
+  f.pending([{ id: 'human-work', messageId: 'human-message' }]);
+  await f.idle();
+  f.pending([]);
+  f.config({ enabled: false });
+  await f.idle();
+  assert.equal(f.sent.length, 0);
+  assert.equal((await f.state()).completedCheckpoints, 0);
+});
+
+test('recovery is read-only and cannot count toward the integration cadence', async () => {
+  const f = await fixture();
+  await f.store.transaction(state => { state.completedCheckpoints = 4; });
+  await f.event('session.compaction_complete', { success: true });
+  await f.idle();
+  assert.equal((await f.state()).captureInFlight.kind, 'recovery');
+  assert.equal((await f.state()).captureInFlight.integration, false);
+  await f.event('user.message', { messageId: 'message-1' });
+  await f.idle();
+  assert.equal((await f.state()).completedCheckpoints, 4);
+  assert.equal((await f.state()).lastIntegrationEpoch, null);
+  assert.equal(f.sent.length, 1);
+});
+
+test('integration prompt uses topic notes, local routing, write holds and bounded session provenance', () => {
+  const prompt = checkpointPrompt('integration-test', { cwd: 'C:\\synthetic', branch: 'synthetic' }, true);
+  assert.match(prompt, /memory-integrate skill instead of memory-capture/);
+  assert.match(prompt, /canonical local Basic Memory topic notes/);
+  assert.match(prompt, /write holds/);
+  assert.match(prompt, /Do not duplicate that thread key/);
+  assert.match(prompt, /"copilot_session_id":"integration-test"/);
+  assert.match(prompt, /No useful new knowledge is a valid no-change result/);
 });
 
 test('aborted checkpoint clears the active label and shows no recursion or success claim', async () => {

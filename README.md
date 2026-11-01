@@ -133,6 +133,43 @@ there is no byte fallback. Compaction resets context baselines, and a missed
 pre-compaction opportunity does not schedule a recovery capture afterward.
 Capture before every compaction is not guaranteed.
 
+### Integration checkpoints
+
+Every **fifth completed checkpoint** uses the installed `memory-integrate` skill
+instead of `memory-capture`: checkpoints 5, 10, 15, and so on. Integration updates
+canonical topic notes rather than creating another large session-summary note.
+The completion count persists across resume and compaction. Existing sessions
+start counting prospectively when upgraded; old checkpoint history is preserved,
+not reconstructed from logs.
+
+If the current compaction cycle has completed no integration and native usage
+reaches **70%**, an additional integration becomes eligible at safe idle after the
+existing five-minute pressure gap. It is independent of the periodic token
+interval and can still occur after the cycle's normal 65% pressure checkpoint.
+Compaction resets the integration safeguard, not the fifth-checkpoint count.
+Accepted integration pressure attempts are coalesced and are not immediately
+repeated after an abort; ordinary checkpoint send failures retain their bounded
+retry behavior.
+
+The status line adds **`(integration)`**, with the word in yellow, to the
+next-checkpoint target/countdown or queued/in-progress checkpoint when that action
+will integrate. Ordinary checkpoint text and percentage warnings keep their
+existing colors. The timeline says `Memory integration queued`.
+
+Only bridge-requested, started, non-aborted checkpoint turns observed finishing
+advance this count. Recovery turns and unconfirmed/cancelled requests do not.
+A completed integration turn counts even if there was no useful new knowledge
+and no note changes; it does not prove successful corpus mutation. Manual
+integrations outside the bridge are not tracked. Historical `last checkpoint`
+still describes a checkpoint turn, not proof of a saved session capture.
+
+The installed `memory-integrate` skill must allow user-configured checkpoint
+integration. npx does not install or rewrite skills or the MCP server. Integration
+prompts require explicit local corpus routing, preserve existing topic-note
+paths and history, respect write holds, and do not authorize corpus Git pushes,
+sync/reindex, unrelated work or other-session inspection. `enabled: false`
+disables new bridge requests, including integration.
+
 ### Recovering state after compaction
 
 After a successful root-session compaction, the bridge offers a separate

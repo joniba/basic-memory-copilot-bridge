@@ -49,13 +49,19 @@ async function fileOperation(operation, action, report) {
 }
 
 function selectContribution(contribution) {
+  const annotate = value => value === undefined ? {} : {
+    annotation: { text: value.text, color: value.color },
+  };
   return contribution ? {
     kind: contribution.kind, color: contribution.color, priority: contribution.priority,
+    ...annotate(contribution.annotation),
     ...(contribution.kind === 'activity' ? {
       label: contribution.label,
       ...(contribution.prefix === undefined ? {} : { prefix: contribution.prefix }),
     } : {
-      targets: contribution.targets.map(target => ({ tokens: target.tokens, notBefore: target.notBefore })),
+      targets: contribution.targets.map(target => ({
+        tokens: target.tokens, notBefore: target.notBefore, ...annotate(target.annotation),
+      })),
       ...(contribution.tokenCeiling === undefined ? {} : { tokenCeiling: contribution.tokenCeiling }),
       labels: {
         tokens: contribution.labels.tokens, time: contribution.labels.time, ready: contribution.labels.ready,

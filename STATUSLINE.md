@@ -125,7 +125,22 @@ boundary while waiting for a future time gate. Already-reached, time-eligible
 targets remain eligible display choices. This generic boundary has no provider-
 specific meaning in the compositor.
 
-The bridge's examples are:
+An activity or hint may include an optional
+`annotation: { text: "integration", color: "yellow" }`. Hint targets may carry
+their own annotations: the selected target's annotation is used unless the
+contribution supplies one. Text is limited to 40 printable characters and colors
+to the existing white/yellow/red palette. The compositor appends white
+parentheses with only the annotation text colored, without changing the target
+or time calculation. The publisher copies only annotation text/color.
+
+Integration examples:
+
+```text
+tokens: 567K (61% — nearing compaction) last checkpoint: 411K, next checkpoint: 580K (integration)
+tokens: 567K (61% — nearing compaction) last checkpoint: 411K, next checkpoint: queued (integration)
+```
+
+The bridge's other examples are:
 
 ```text
 tokens: 500K (55%) last checkpoint: 455K, next checkpoint: 505K

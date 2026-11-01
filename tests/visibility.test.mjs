@@ -25,6 +25,7 @@ const red = value => `\u001b[31m${value}\u001b[39m`;
 
 function stateAt(baseline = 455000, tokens = 500000) {
   const state = freshState('test-session');
+  state.lastIntegrationEpoch = state.compactionEpoch;
   applyUsage(state, usage(baseline), defaults);
   applyUsage(state, usage(tokens), defaults);
   return state;
@@ -38,6 +39,44 @@ test('idle hint uses earliest token target and white independent foreground', ()
     `tokens: 500K (${white('50%')}) ${white('last checkpoint: none, next checkpoint: 505K')}`);
 });
 
+test('the upcoming fifth checkpoint shows the requested integration suffix in yellow only', () => {
+  const state = stateAt(411000, 567000);
+  state.completedCheckpoints = 4;
+  state.lastCheckpointTokens = 411000;
+  const currentUsage = { currentTokens: 567000, tokenLimit: 922000, compactionThreshold: 737600 };
+  const hint = statusContribution(state, currentUsage, { ...defaults, periodicMinimumNewTokens: 169000 });
+  const native = { session_id: 'test-session', context_window: {
+    current_context_tokens: 567000, displayed_context_limit: 922000,
+  } };
+  assert.equal(tokenBadge(native, [hint], now),
+    `tokens: 567K (${yellow('61% \u2014 nearing compaction')}) ${white('last checkpoint: 411K, next checkpoint: 580K')}${white(' (')}${yellow('integration')}${white(')')}`);
+  state.captureInFlight = { id: 'fifth', kind: 'periodic', epoch: 0, integration: true,
+    messageId: 'accepted', started: false };
+  assert.equal(tokenBadge(native, [statusContribution(state, currentUsage, defaults)], now),
+    `tokens: 567K (${yellow('61% \u2014 nearing compaction')}) ${white('last checkpoint: 411K, next checkpoint: ')}${yellow('queued')}${white(' (')}${yellow('integration')}${white(')')}`);
+});
+
+test('forecast selects the integration annotation only when its pressure target is the next action', () => {
+  const state = stateAt(500000, 600000);
+  state.lastIntegrationEpoch = null;
+  state.lastOpportunityTokens = 600000;
+  const hint = statusContribution(state, usage(600000), { ...defaults, periodicMinimumNewTokens: 200000 });
+  assert.equal(contributionLabel(hint, 600000, now).annotation, undefined);
+  state.pressureOpportunityEpoch = state.compactionEpoch;
+  const integration = statusContribution(state, usage(600000), { ...defaults, periodicMinimumNewTokens: 200000 });
+  assert.equal(contributionLabel(integration, 600000, now).text, 'last checkpoint: none, next checkpoint: 700K');
+  assert.deepEqual(contributionLabel(integration, 600000, now).annotation, { text: 'integration', color: 'yellow' });
+  assert.equal(contributionLabel(integration, 700000, now).text, 'last checkpoint: none, next checkpoint: awaiting idle');
+});
+
+test('generic annotations reject invalid colors and control characters without altering ordinary contributions', () => {
+  for (const annotation of [{ text: 'integration', color: 'orange' }, { text: '\u001b[31m', color: 'yellow' },
+    { text: '', color: 'yellow' }, { text: 'x'.repeat(41), color: 'yellow' }]) {
+    assert.equal(validContribution({ ...activity('Working'), annotation }), false);
+  }
+  const annotated = { ...activity('Working'), annotation: { text: 'integration', color: 'yellow' } };
+  assert.equal(tokenBadge({}, [annotated]), `${yellow('Working')}${white(' (')}${yellow('integration')}${white(')')}`);
+});
 test('recovery status preserves historical checkpoint text without claiming another checkpoint', () => {
   const state = stateAt();
   state.lastCheckpointTokens = 198000;
@@ -61,6 +100,25 @@ test('pressure target wins when periodic threshold is farther away', () => {
   assert.equal(contributionLabel(hint, 630000, now).text, 'last checkpoint: none, next checkpoint: 650K');
 });
 
+test('published integration annotations survive the generic reader without extra payload fields', async () => {
+  const target = await mkdtemp(join(run, 'annotation-'));
+  const publisher = new StatusPublisher(target, 'annotation-session', 'provider', { clock: () => now });
+  try {
+    await publisher.publish({
+      kind: 'hint', priority: 10, color: 'white',
+      annotation: { text: 'integration', color: 'yellow', extra: 'must not persist' },
+      targets: [{ tokens: 580000, notBefore: 0, annotation: { text: 'integration', color: 'yellow', extra: 'must not persist' } }],
+      labels: { tokens: 'next checkpoint: {tokens}', time: 'in {minutes}m', ready: 'awaiting idle' },
+    });
+    const record = JSON.parse(await readFile(publisher.path, 'utf8'));
+    assert.ok(!JSON.stringify(record).includes('must not persist'));
+    const [contribution] = await readContributions(target, 'annotation-session', { now });
+    assert.deepEqual(contributionLabel(contribution, 567000, now).annotation, { text: 'integration', color: 'yellow' });
+    assert.equal(contributionLabel(contribution, 567000, now).text, 'next checkpoint: 580K');
+  } finally {
+    await publisher.close();
+  }
+});
 test('reached target shows live cooldown countdown, then awaits idle without claiming acceptance', () => {
   const state = stateAt();
   state.lastOpportunityAt = now - 48 * 60000;

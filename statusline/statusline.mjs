@@ -12,7 +12,8 @@ const count = value => Number.isSafeInteger(value) && value >= 0;
 const diagnostic = code => process.stderr.write(`context-token-statusline: ${code}\n`);
 
 const paint = (text, color) => `${{ white: '\u001b[37m', yellow: '\u001b[33m', red: '\u001b[31m' }[color]}${text}\u001b[39m`;
-const paintLabel = label => `${label.prefix ? paint(label.prefix, 'white') : ''}${paint(label.text, label.color)}`;
+const paintLabel = label => `${label.prefix ? paint(label.prefix, 'white') : ''}${paint(label.text, label.color)}${label.annotation
+  ? `${paint(' (', 'white')}${paint(label.annotation.text, label.annotation.color)}${paint(')', 'white')}` : ''}`;
 
 export function tokenBadge(status, contributions = [], now = Date.now()) {
   const candidates = contributions.filter(validContribution).sort((a, b) => b.priority - a.priority);
