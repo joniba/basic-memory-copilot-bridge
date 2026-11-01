@@ -203,6 +203,7 @@ test('context shrink and post-compaction pressure baseline remain conservative',
   const hint = statusContribution(state, usage(100000), defaults);
   assert.equal(Math.min(...hint.targets.map(value => value.tokens)), 150000);
   state.compactionEpoch = 1;
+  state.lastIntegrationEpoch = state.compactionEpoch;
   state.baselineTokens = 700000;
   state.lastOpportunityTokens = null;
   state.lastContextTokens = 700000;
@@ -211,6 +212,13 @@ test('context shrink and post-compaction pressure baseline remain conservative',
   assert.equal(contributionLabel(post, 700000, now).text, 'last checkpoint: none, next checkpoint: 701K');
 });
 
+test('a high post-compaction baseline forecasts integration at the existing 70 percent target', () => {
+  const state = stateAt(750000, 750000);
+  state.compactionEpoch = 2;
+  const hint = statusContribution(state, usage(750000), defaults);
+  assert.equal(contributionLabel(hint, 750000, now).text, 'last checkpoint: none, next checkpoint: awaiting idle');
+  assert.deepEqual(contributionLabel(hint, 750000, now).annotation, { text: 'integration', color: 'yellow' });
+});
 test('generic schedule avoids rounding a token target down prematurely', () => {
   const hint = statusContribution(stateAt(455001), usage(500000), defaults);
   assert.equal(contributionLabel(hint, 505000, now).text, 'last checkpoint: none, next checkpoint: 506K');

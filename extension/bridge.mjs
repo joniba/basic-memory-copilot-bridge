@@ -195,6 +195,15 @@ export function applyUsage(state, usage, config) {
     && (state.compactionEpoch === 0 || tokens > state.baselineTokens);
 }
 
+function integrationPressureEligible(state, config, now) {
+  const elapsed = state.lastOpportunityAt === null ? Infinity : now - state.lastOpportunityAt;
+  return config.enabled && count(state.lastContextTokens) && count(state.tokenLimit) && state.tokenLimit > 0
+    && state.lastIntegrationEpoch !== state.compactionEpoch
+    && state.integrationPressureOpportunityEpoch !== state.compactionEpoch
+    && state.lastContextTokens / state.tokenLimit >= integrationThreshold
+    && elapsed >= config.pressureMinimumMinutesBetweenOpportunities * 60000;
+}
+
 export function eligibility(state, config, now) {
   if (!config.enabled) return 'disabled';
   if (state.captureInFlight) return 'in-flight';
@@ -202,12 +211,9 @@ export function eligibility(state, config, now) {
   if (state.retryAfter !== null && now < state.retryAfter) return 'retry-cooldown';
   if (state.lastContextTokens === null || state.tokenLimit === null) return 'usage-unavailable';
   const elapsed = state.lastOpportunityAt === null ? Infinity : now - state.lastOpportunityAt;
-  const needsPressureIntegration = state.lastIntegrationEpoch !== state.compactionEpoch
-    && state.integrationPressureOpportunityEpoch !== state.compactionEpoch
-    && state.lastContextTokens / state.tokenLimit >= integrationThreshold
-    && (state.compactionEpoch === 0 || state.lastContextTokens > state.baselineTokens);
-  if (((state.pressurePending && state.pressureOpportunityEpoch !== state.compactionEpoch) || needsPressureIntegration)
-    && elapsed >= config.pressureMinimumMinutesBetweenOpportunities * 60000) return 'pressure';
+  if (integrationPressureEligible(state, config, now)
+    || (state.pressurePending && state.pressureOpportunityEpoch !== state.compactionEpoch
+      && elapsed >= config.pressureMinimumMinutesBetweenOpportunities * 60000)) return 'pressure';
   const watermark = state.lastOpportunityTokens ?? state.baselineTokens;
   if (watermark !== null && state.lastContextTokens - watermark >= config.periodicMinimumNewTokens
     && elapsed >= config.minimumMinutesBetweenOpportunities * 60000) return 'periodic';
@@ -270,8 +276,7 @@ export function statusContribution(state, usage, config) {
   }
   if (state.lastIntegrationEpoch !== state.compactionEpoch
     && state.integrationPressureOpportunityEpoch !== state.compactionEpoch) {
-    const pressure = Math.max(Math.ceil(usage.tokenLimit * integrationThreshold),
-      snapshot.baselineTokens + (state.compactionEpoch > 0 ? 1 : 0));
+    const pressure = Math.ceil(usage.tokenLimit * integrationThreshold);
     if (count(pressure)) targets.push({
       tokens: pressure,
       notBefore: Math.max(delay, state.lastOpportunityAt === null ? 0
@@ -458,7 +463,7 @@ export class CaptureBridge {
   start() {
     return this.enqueue(async () => {
       await this.initialize();
-      await this.checkRecoveryIdle();
+      await this.checkPendingIdleWork();
     });
   }
 
@@ -507,23 +512,32 @@ export class CaptureBridge {
     return this.enqueue(async () => {
       await this.handle(event);
       if (event.type === 'session.compaction_complete' && event.data.success === true) {
-        await this.checkRecoveryIdle();
+        await this.checkPendingIdleWork();
       }
     });
   }
 
-  async checkRecoveryIdle() {
+  async checkPendingIdleWork() {
     if (!this.ready || this.stopped || this.compactionStarting
-      || !this.lastState || this.lastState.pendingRecoveryEpoch === null || this.lastState.captureInFlight) return;
+      || !this.lastState || this.lastState.captureInFlight) return;
     const config = await this.readConfig();
-    if (!config.enabled || !config.recoverAfterCompaction) return;
+    if (!config.enabled) return;
+    const recovery = config.recoverAfterCompaction && this.lastState.pendingRecoveryEpoch !== null;
+    if (!recovery) {
+      if (!this.usage) await this.refreshUsage();
+      if (!this.usage) return;
+      const state = structuredClone(this.lastState);
+      applyUsage(state, this.usage, config);
+      if (!integrationPressureEligible(state, config, this.clock())) return;
+    }
     const { processing } = await bounded(this.session.rpc.metadata.isProcessing());
     if (typeof processing !== 'boolean') throw new Error('processing-state-invalid');
     if (processing) {
-      await this.report('bridge.recovery_check', 'recovery-awaiting-idle', config);
+      await this.report(recovery ? 'bridge.recovery_check' : 'bridge.integration_check',
+        recovery ? 'recovery-awaiting-idle' : 'integration-awaiting-idle', config);
       return;
     }
-    await this.handle({ type: 'bridge.recovery_check', data: {} });
+    await this.handle({ type: recovery ? 'bridge.recovery_check' : 'bridge.integration_check', data: {} });
   }
 
   async refreshUsage() {
@@ -638,9 +652,9 @@ export class CaptureBridge {
       await this.report(event.type, 'shutdown', config);
       return;
     }
-    if (!['session.idle', 'bridge.recovery_check', 'user.message', 'session.compaction_start',
+    if (!['session.idle', 'bridge.recovery_check', 'bridge.integration_check', 'user.message', 'session.compaction_start',
       'session.compaction_complete', 'session.context_cleared'].includes(event.type)) return;
-    if (event.type === 'session.idle' || event.type === 'bridge.recovery_check') await this.refreshUsage();
+    if (['session.idle', 'bridge.recovery_check', 'bridge.integration_check'].includes(event.type)) await this.refreshUsage();
     let offer;
     await this.transaction(async (state, recovered) => {
       if (this.usage && !state.compacting) applyUsage(state, this.usage, config);
@@ -722,7 +736,8 @@ export class CaptureBridge {
           if (item || activity.hasActiveWork) await this.report(event.type, 'in-flight', config);
           else await this.finish(state, 'in-flight-reconciled');
         }
-        if (state.captureInFlight || state.pendingRecoveryEpoch === null) return;
+        if (state.captureInFlight || (state.pendingRecoveryEpoch === null
+          && !integrationPressureEligible(state, config, this.clock()))) return;
       }
       if (recovered) {
         await this.report(event.type, 'state-recovered', config);
@@ -737,6 +752,7 @@ export class CaptureBridge {
         && (state.retryAfter === null || this.clock() >= state.retryAfter)
         ? 'recovery' : eligibility(state, config, this.clock());
       if (event.type === 'bridge.recovery_check' && decision !== 'recovery') return;
+      if (event.type === 'bridge.integration_check' && !integrationPressureEligible(state, config, this.clock())) return;
       if (!['periodic', 'pressure', 'recovery'].includes(decision) || this.compactionStarting) {
         await this.report(event.type, this.compactionStarting ? 'compacting' : decision, config);
         return;

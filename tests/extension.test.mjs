@@ -272,6 +272,27 @@ test('integration cadence survives reload and legacy state starts counting prosp
   assert.equal((await legacy.state()).lastCheckpointAt, start - 1000);
 });
 
+test('initializing while already idle above 70 percent offers integration without waiting for a new idle event', async () => {
+  const f = await fixture();
+  f.processing(false);
+  f.info({ totalTokens: 70000, limit: 100000 });
+  await f.reload();
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).captureInFlight.integration, true);
+  assert.ok(f.logs.some(row => row.event === 'bridge.integration_check' && row.gateDecision === 'offered:pressure'));
+});
+
+test('manual compaction already idle above 70 percent can integrate even when recovery is disabled', async () => {
+  const f = await fixture({ recoverAfterCompaction: false });
+  f.processing(false);
+  f.info({ totalTokens: 75000, limit: 100000 });
+  await f.event('session.compaction_complete', { success: true });
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).captureInFlight.kind, 'pressure');
+  assert.equal((await f.state()).captureInFlight.integration, true);
+  assert.equal((await f.state()).pendingRecoveryEpoch, null);
+});
+
 test('integration pressure yields to active user work and does not override disable or compaction guards', async () => {
   const f = await fixture();
   f.info({ totalTokens: 70000, limit: 100000 });
@@ -299,6 +320,40 @@ test('recovery is read-only and cannot count toward the integration cadence', as
   assert.equal((await f.state()).completedCheckpoints, 4);
   assert.equal((await f.state()).lastIntegrationEpoch, null);
   assert.equal(f.sent.length, 1);
+});
+
+test('recovery finishing above 70 percent can admit integration at that safe idle without counting recovery', async () => {
+  const f = await fixture();
+  await f.event('session.compaction_complete', { success: true });
+  f.info({ totalTokens: 10000, limit: 100000 });
+  await f.idle();
+  await f.event('user.message', { messageId: 'message-1' });
+  f.info({ totalTokens: 75000, limit: 100000 });
+  await f.idle();
+  assert.equal(f.sent.length, 2);
+  assert.equal((await f.state()).captureInFlight.integration, true);
+  assert.equal((await f.state()).completedCheckpoints, 0);
+  await f.event('user.message', { messageId: 'message-2' });
+  await f.idle();
+  assert.equal((await f.state()).completedCheckpoints, 1);
+  assert.equal((await f.state()).lastIntegrationEpoch, 1);
+  assert.equal(f.sent.length, 2);
+});
+
+test('a long capture finishing above 70 percent offers only the eligible integration, not a recursive periodic capture', async () => {
+  const f = await fixture();
+  f.info({ totalTokens: 65000, limit: 100000 });
+  await f.idle();
+  await f.event('user.message', { messageId: 'message-1' });
+  f.info({ totalTokens: 75000, limit: 100000 });
+  f.time(start + 300000);
+  await f.idle();
+  assert.equal(f.sent.length, 2);
+  assert.equal((await f.state()).captureInFlight.integration, true);
+  assert.equal((await f.state()).completedCheckpoints, 1);
+  await f.event('user.message', { messageId: 'message-2' });
+  await f.idle();
+  assert.equal(f.sent.length, 2);
 });
 
 test('integration prompt uses topic notes, local routing, write holds and bounded session provenance', () => {
@@ -702,20 +757,34 @@ test('only own queued checkpoint is cancelled when compaction starts', async () 
   assert.equal((await f.state()).captureInFlight, null);
 });
 
-test('high post-compaction context cannot replay a pressure checkpoint without new activity', async () => {
+test('high post-compaction context requires one integration without replaying ordinary pressure checkpoints', async () => {
   const f = await fixture({ recoverAfterCompaction: false });
   await f.event('session.compaction_start');
   await f.event('session.compaction_complete', { success: true });
   f.info({ totalTokens: 70000, limit: 100000 });
   await f.idle();
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).captureInFlight.integration, true);
+  await f.event('user.message', { messageId: 'message-1' });
+  await f.idle();
   f.time(start + 3600000);
   await f.idle();
-  assert.equal(f.sent.length, 0);
+  assert.equal(f.sent.length, 1);
   f.info({ totalTokens: 71000, limit: 100000 });
   await f.idle();
   assert.equal(f.sent.length, 1, JSON.stringify({ state: await f.state(), logs: f.logs, notices: f.warnings }));
 });
 
+test('integration pressure does not require growth after a high post-compaction baseline', () => {
+  const state = Object.assign(freshState('compacted-high'), {
+    compactionEpoch: 2, baselineTokens: 75000, lastContextTokens: 75000,
+    tokenLimit: 100000, pressurePending: false,
+  });
+  assert.equal(eligibility(state, defaults, start), 'pressure');
+  assert.equal(integrationCheckpoint(state), true);
+  state.lastIntegrationEpoch = 2;
+  assert.equal(eligibility(state, defaults, start), 'below-gate');
+});
 test('queued user work prevents an idle checkpoint', async () => {
   const f = await fixture();
   f.info({ totalTokens: 65000, limit: 100000 });

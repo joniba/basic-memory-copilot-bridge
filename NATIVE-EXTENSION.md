@@ -135,6 +135,14 @@ safe idle, subject to the existing five-minute opportunity gap and all
 active/queued-work, usage, retry and compaction guards. This remains available
 after an earlier normal pressure checkpoint. Its accepted pressure attempt is
 recorded separately to prevent immediate repeated integrations after an abort.
+The 70% safeguard also applies when compaction leaves an already-high baseline;
+it does not require additional token growth. A capture or recovery turn finishing
+at safe idle may admit this eligible integration, subject to the pressure gap,
+but does not recursively admit an ordinary periodic checkpoint.
+An already-idle initialization or manual compaction uses the native processing
+check to admit only an eligible integration (`bridge.integration_check`) when
+there is no pending read-only recovery. The check still revalidates usage,
+activity and queued work, and never starts a normal periodic capture.
 
 `completedCheckpoints`, `lastIntegrationEpoch` and
 `integrationPressureOpportunityEpoch` are bounded operational state, not note

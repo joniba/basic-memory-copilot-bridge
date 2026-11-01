@@ -147,6 +147,9 @@ reaches **70%**, an additional integration becomes eligible at safe idle after t
 existing five-minute pressure gap. It is independent of the periodic token
 interval and can still occur after the cycle's normal 65% pressure checkpoint.
 Compaction resets the integration safeguard, not the fifth-checkpoint count.
+An already-high post-compaction baseline is included. If a capture or recovery
+finishes above 70%, that safe idle can admit the required integration after the
+pressure gap; it does not automatically chain ordinary periodic captures.
 Accepted integration pressure attempts are coalesced and are not immediately
 repeated after an abort; ordinary checkpoint send failures retain their bounded
 retry behavior.
