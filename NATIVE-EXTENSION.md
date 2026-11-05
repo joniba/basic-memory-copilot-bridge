@@ -135,10 +135,19 @@ watermarks after a lower native reading, including on reload with the same
 compaction count; see the installation guide's preservation caveat.
 
 Diagnostics contain only timestamp, session ID, event, ratio, and fixed
-decision codes. Repeated identical decisions are limited to once per minute;
-each session log stops growing at 1 MiB. No prompts, transcript contents,
-tool results, paths, or exception text are logged. Errors produce a bounded
-timeline warning. Set `enabled: false` to stop new automatic opportunities.
+decision codes. Failures also identify the initialization/event phase,
+operation (for example `metadata.context-attribution` or `state.lock-acquire`),
+allowlisted filesystem/RPC error code, and error type. Unknown values become
+`unknown`/`UNKNOWN`; raw exception messages and stacks are never recorded.
+The timeline warning includes the same safe operation/code/type, so a failed
+initialization is distinguishable from a running process that successfully
+recorded `startup` / `attached`. Initialization retries at the next root idle.
+If the session log cannot be written, sanitized diagnostics fall back to the
+extension process log, retaining both the original failure and the logging failure.
+Repeated identical decisions/failures are limited to once per minute; distinct
+operations or error codes are not suppressed together. Each session log stops
+growing at 1 MiB. No prompts, transcript contents, tool results, paths, or
+exception text are logged. Set `enabled: false` to stop new automatic opportunities.
 
 ## Status-line contribution
 

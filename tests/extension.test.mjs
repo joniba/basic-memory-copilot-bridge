@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
-  applyUsage, CaptureBridge, checkpointPrompt, createLogger, defaults,
+  applyUsage, bridgeDiagnostic, CaptureBridge, checkpointPrompt, createLogger, defaults,
   eligibility, FileStateStore, freshState, validateConfig,
   statusContribution,
   recoveryPrompt,
@@ -860,6 +860,43 @@ test('failed initialization does not prompt until it can establish the native ba
   assert.equal(f.sent.length, 1);
 });
 
+test('attribution failure records its operation and safe RPC code, then retries initialization without duplicate capture', async () => {
+  const f = await fixture();
+  const attribution = f.session.rpc.metadata.getContextAttribution;
+  f.logs.length = 0;
+  f.session.rpc.metadata.getContextAttribution = async () => {
+    throw Object.assign(new Error('private-native-error'), { code: -32601, data: 'private-response' });
+  };
+  await f.reload();
+  const failed = f.logs.find(row => row.gateDecision === 'event-error');
+  assert.equal(failed.phase, 'initialization');
+  assert.equal(failed.operation, 'metadata.context-attribution');
+  assert.equal(failed.code, -32601);
+  assert.equal(failed.errorType, 'Error');
+  assert.match(f.warnings.at(-1).message, /metadata.context-attribution: -32601/);
+  assert.ok(!f.logs.some(row => row.gateDecision === 'attached'));
+  f.info({ totalTokens: 51000, limit: 200000 });
+  await f.idle();
+  assert.equal(f.sent.length, 0);
+  assert.ok(!JSON.stringify([f.logs, f.warnings]).includes('private'));
+  f.session.rpc.metadata.getContextAttribution = attribution;
+  await f.idle();
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  assert.ok(f.logs.some(row => row.gateDecision === 'attached'));
+});
+
+test('invalid attribution response retains the failing operation without exposing exception text', async () => {
+  const f = await fixture();
+  f.session.rpc.metadata.getContextAttribution = async () => null;
+  await f.reload();
+  const failed = f.logs.findLast(row => row.gateDecision === 'event-error');
+  assert.equal(failed.operation, 'metadata.context-attribution');
+  assert.equal(failed.errorType, 'TypeError');
+  assert.equal(failed.code, 'UNKNOWN');
+  assert.ok(!JSON.stringify(f.logs).includes('Cannot read'));
+});
+
 test('failed compaction clears busy guard without advancing epoch', async () => {
   const f = await fixture();
   await f.event('session.compaction_start');
@@ -977,6 +1014,25 @@ test('busy lock fails open without stealing another owner lock', async () => {
   await f.idle();
   assert.equal(f.sent.length, 0);
   assert.equal(await readFile(`${f.store.path}.lock`, 'utf8'), 'owner');
+  const failed = f.logs.findLast(row => row.gateDecision === 'event-error');
+  assert.equal(failed.operation, 'state.lock-acquire');
+  assert.equal(failed.code, 'EEXIST');
+  assert.equal(failed.phase, 'event');
+  assert.ok(!JSON.stringify([f.logs, f.warnings]).includes(f.directory));
+});
+
+test('diagnostic codes are allowlisted even when nested errors contain private fields', () => {
+  const privateError = Object.assign(new Error('private-message'), {
+    name: 'private-type', code: 'private-code', operation: 'private-operation', stack: 'private-stack',
+  });
+  assert.deepEqual(bridgeDiagnostic(privateError), {
+    operation: 'unknown', code: 'UNKNOWN', errorType: 'UNKNOWN',
+  });
+  const nested = new Error('private-wrapper', { cause: Object.assign(new Error('private-cause'), { code: 'EACCES' }) });
+  assert.deepEqual(bridgeDiagnostic(nested), {
+    operation: 'unknown', code: 'EACCES', errorType: 'Error',
+  });
+  assert.equal(bridgeDiagnostic(new Error('rpc-timeout')).code, 'RPC_TIMEOUT');
 });
 
 test('bounded diagnostics contain only allowed operational fields', async () => {
@@ -992,6 +1048,57 @@ test('bounded diagnostics contain only allowed operational fields', async () => 
   assert.deepEqual(Object.keys(JSON.parse(rows[0])).sort(), ['contextRatio', 'event', 'gateDecision', 'sessionId', 'timestamp'].sort());
   assert.ok(!text.includes('private'));
   assert.ok(!text.includes('synthetic-secret'));
+});
+
+test('persisted failures retain safe details and do not throttle different operations or codes together', async () => {
+  const directory = await mkdtemp(join(run, 'failure-logs-'));
+  const logger = createLogger(directory, 'test-session', () => start);
+  const record = {
+    event: 'bridge', gateDecision: 'event-error', phase: 'initialization',
+    operation: 'metadata.context-attribution', code: -32601, errorType: 'Error',
+    message: 'private-message', stack: 'private-stack', path: 'private-path',
+  };
+  await logger(record);
+  await logger(record);
+  await logger({ ...record, operation: 'state.lock-acquire', code: 'EEXIST' });
+  await logger({ ...record, code: 'RPC_TIMEOUT' });
+  await logger({ ...record, operation: 'private-operation', code: 'private-code', errorType: 'private-type' });
+  const text = await readFile(join(directory, 'test-session.jsonl'), 'utf8');
+  const rows = text.trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(rows.length, 4);
+  assert.deepEqual(rows[0], {
+    timestamp: new Date(start).toISOString(), sessionId: 'test-session',
+    event: 'bridge', gateDecision: 'event-error', phase: 'initialization',
+    operation: 'metadata.context-attribution', code: -32601, errorType: 'Error',
+  });
+  assert.equal(rows[1].operation, 'state.lock-acquire');
+  assert.equal(rows[2].code, 'RPC_TIMEOUT');
+  assert.equal(rows[3].operation, 'unknown');
+  assert.equal(rows[3].code, 'UNKNOWN');
+  assert.equal(rows[3].errorType, 'UNKNOWN');
+  assert.ok(!text.includes('private'));
+});
+
+test('a failed diagnostic writer falls back to safe stderr without breaking later events', async t => {
+  const f = await fixture();
+  const stderr = [];
+  t.mock.method(console, 'error', value => stderr.push(JSON.parse(value)));
+  const bridge = new CaptureBridge({
+    session: f.session, store: f.store, config: async () => defaults,
+    log: async () => { throw Object.assign(new Error('private-log-path'), { code: 'EACCES' }); },
+    clock: () => start,
+  });
+  f.session.rpc.metadata.getContextAttribution = async () => {
+    throw Object.assign(new Error('private-rpc-data'), { code: -32601 });
+  };
+  await bridge.start();
+  assert.equal(stderr.at(-1).operation, 'metadata.context-attribution');
+  assert.equal(stderr.at(-1).code, -32601);
+  assert.deepEqual(stderr.at(-1).diagnosticFailure, {
+    operation: 'diagnostic.write', code: 'EACCES', errorType: 'Error',
+  });
+  assert.ok(!JSON.stringify(stderr).includes('private'));
+  await bridge.on({ type: 'session.usage_info', data: { currentTokens: 1000, tokenLimit: 200000 } });
 });
 
 test('state filenames reject traversal and state contains no context/prompt text', async () => {
