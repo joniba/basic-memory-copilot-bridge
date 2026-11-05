@@ -39,9 +39,9 @@ test('idle hint uses earliest token target and white independent foreground', ()
     `tokens: 500K (${white('50%')}) ${white('last checkpoint: none, next checkpoint: 505K')}`);
 });
 
-test('the upcoming fifth checkpoint shows the requested integration suffix in yellow only', () => {
+test('capture forecasts stay unchanged and eligible idle integration has a separate static yellow label', () => {
   const state = stateAt(411000, 567000);
-  state.completedCheckpoints = 4;
+  state.completedCaptures = 4;
   state.lastCheckpointTokens = 411000;
   const currentUsage = { currentTokens: 567000, tokenLimit: 922000, compactionThreshold: 737600 };
   const hint = statusContribution(state, currentUsage, { ...defaults, periodicMinimumNewTokens: 169000 });
@@ -49,24 +49,27 @@ test('the upcoming fifth checkpoint shows the requested integration suffix in ye
     current_context_tokens: 567000, displayed_context_limit: 922000,
   } };
   assert.equal(tokenBadge(native, [hint], now),
-    `tokens: 567K (${yellow('61% \u2014 nearing compaction')}) ${white('last checkpoint: 411K, next checkpoint: 580K')}${white(' (')}${yellow('integration')}${white(')')}`);
-  state.captureInFlight = { id: 'fifth', kind: 'periodic', epoch: 0, integration: true,
+    `tokens: 567K (${yellow('61% \u2014 nearing compaction')}) ${white('last checkpoint: 411K, next checkpoint: 580K')}`);
+  assert.equal(tokenBadge(native, [statusContribution(state, currentUsage, defaults, true)], now),
+    `tokens: 567K (${yellow('61% \u2014 nearing compaction')}) ${white('last checkpoint: 411K, ')}${yellow('integration pending')}`);
+  state.captureInFlight = { id: 'idle', kind: 'integration', epoch: 0, integration: true,
     messageId: 'accepted', started: false };
   assert.equal(tokenBadge(native, [statusContribution(state, currentUsage, defaults)], now),
-    `tokens: 567K (${yellow('61% \u2014 nearing compaction')}) ${white('last checkpoint: 411K, next checkpoint: ')}${yellow('queued')}${white(' (')}${yellow('integration')}${white(')')}`);
+    `tokens: 567K (${yellow('61% \u2014 nearing compaction')}) ${white('last checkpoint: 411K, memory integration: ')}${yellow('queued')}`);
 });
 
-test('forecast selects the integration annotation only when its pressure target is the next action', () => {
+test('pressure integration does not add a fake capture target to the forecast', () => {
   const state = stateAt(500000, 600000);
   state.lastIntegrationEpoch = null;
   state.lastOpportunityTokens = 600000;
   const hint = statusContribution(state, usage(600000), { ...defaults, periodicMinimumNewTokens: 200000 });
   assert.equal(contributionLabel(hint, 600000, now).annotation, undefined);
   state.pressureOpportunityEpoch = state.compactionEpoch;
-  const integration = statusContribution(state, usage(600000), { ...defaults, periodicMinimumNewTokens: 200000 });
-  assert.equal(contributionLabel(integration, 600000, now).text, 'last checkpoint: none, next checkpoint: 700K');
-  assert.deepEqual(contributionLabel(integration, 600000, now).annotation, { text: 'integration', color: 'yellow' });
-  assert.equal(contributionLabel(integration, 700000, now).text, 'last checkpoint: none, next checkpoint: awaiting idle');
+  const capture = statusContribution(state, usage(600000), { ...defaults, periodicMinimumNewTokens: 200000 });
+  assert.equal(contributionLabel(capture, 600000, now).text, 'last checkpoint: none, next checkpoint: 800K');
+  const integration = statusContribution(state, usage(700000), defaults);
+  assert.equal(contributionLabel(integration, 700000, now).text, 'integration pending');
+  assert.equal(contributionLabel(integration, 700000, now).color, 'yellow');
 });
 
 test('generic annotations reject invalid colors and control characters without altering ordinary contributions', () => {
@@ -212,12 +215,12 @@ test('context shrink and post-compaction pressure baseline remain conservative',
   assert.equal(contributionLabel(post, 700000, now).text, 'last checkpoint: none, next checkpoint: 701K');
 });
 
-test('a high post-compaction baseline forecasts integration at the existing 70 percent target', () => {
+test('a high post-compaction baseline shows a separate pending integration', () => {
   const state = stateAt(750000, 750000);
   state.compactionEpoch = 2;
   const hint = statusContribution(state, usage(750000), defaults);
-  assert.equal(contributionLabel(hint, 750000, now).text, 'last checkpoint: none, next checkpoint: awaiting idle');
-  assert.deepEqual(contributionLabel(hint, 750000, now).annotation, { text: 'integration', color: 'yellow' });
+  assert.equal(contributionLabel(hint, 750000, now).text, 'integration pending');
+  assert.equal(contributionLabel(hint, 750000, now).color, 'yellow');
 });
 test('generic schedule avoids rounding a token target down prematurely', () => {
   const hint = statusContribution(stateAt(455001), usage(500000), defaults);

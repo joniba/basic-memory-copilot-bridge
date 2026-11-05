@@ -30,11 +30,14 @@ try {
   bridge.start();
   session.on(event => bridge.on(event));
   for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => {
+    bridge.stop();
     publisher.close().catch(() => console.error('{"event":"shutdown","gateDecision":"status-error"}'))
       .finally(() => process.exit(0));
   });
-  session.on('session.shutdown', () => publisher.close()
-    .catch(() => console.error('{"event":"shutdown","gateDecision":"status-error"}')));
+  session.on('session.shutdown', () => {
+    bridge.stop();
+    return publisher.close().catch(() => console.error('{"event":"shutdown","gateDecision":"status-error"}'));
+  });
 } catch {
   console.error('{"event":"startup","gateDecision":"connection-error"}');
   if (session) {

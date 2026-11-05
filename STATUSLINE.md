@@ -18,7 +18,7 @@ Installing the BM extension alone does not install or enable this companion.
 Install/update the standalone companion from a published revision:
 
 ```powershell
-npx github:joniba/basic-memory-copilot-bridge --update --statusline-only
+npx --yes "github:joniba/basic-memory-copilot-bridge#main" --update --statusline-only
 ```
 
 The default npx command installs both this companion and the native bridge;
@@ -133,11 +133,18 @@ to the existing white/yellow/red palette. The compositor appends white
 parentheses with only the annotation text colored, without changing the target
 or time calculation. The publisher copies only annotation text/color.
 
+The bridge uses ordinary activity labels for separate integration, leaving
+capture forecasts unchanged. After five eligible idle minutes, only
+`integration pending` is yellow. After admission, `queued` / `in progress` is
+yellow. The history prefix stays white; percentage warnings retain their own
+colors. There is no live integration countdown and integration is not advertised
+as the next capture checkpoint.
+
 Integration examples:
 
 ```text
-tokens: 567K (61% — nearing compaction) last checkpoint: 411K, next checkpoint: 580K (integration)
-tokens: 567K (61% — nearing compaction) last checkpoint: 411K, next checkpoint: queued (integration)
+tokens: 567K (61% — nearing compaction) last checkpoint: 411K, integration pending
+tokens: 567K (61% — nearing compaction) last checkpoint: 411K, memory integration: queued
 ```
 
 The bridge's other examples are:

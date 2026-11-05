@@ -15,7 +15,8 @@ const help = [
   'Session overrides, reset and --global are not supported in this version.',
   'Only periodic token growth changes. Time cooldowns, pressure rules and checkpoint history stay unchanged.',
   'Post-compaction recovery reads existing captures; configure recoverAfterCompaction to enable or disable it.',
-  'Every fifth completed checkpoint uses memory-integrate. At 70%, a cycle with no completed integration can also request one, retaining the five-minute pressure gap.',
+  'Captures always use memory-capture. After three completed captures since integration, five idle minutes show integration pending and ten idle minutes can start memory-integrate (checked about every 30 seconds).',
+  'At 70%, a cycle with no completed integration bypasses the idle delay and capture quota, retaining the five-minute pressure gap. Integration does not reset capture timing or history.',
   'Checkpoints still wait for safe idle. Other sessions adopt updates on their next native event.',
   'Type /bm-bridge and press Enter for the menu. Inline argument suggestions are not available.',
 ].join('\n');
@@ -188,7 +189,7 @@ export function bridgeCommand(path, getBridge) {
           `Machine-wide periodic interval: ${config.periodicMinimumNewTokens / 1000}K tokens; minimum time: ${config.minimumMinutesBetweenOpportunities}m.`,
           `Automatic checkpoints: ${config.enabled ? 'enabled' : 'disabled'}. Pressure: ${config.contextPressureThreshold * 100}%; minimum time: ${config.pressureMinimumMinutesBetweenOpportunities}m; once per compaction epoch.`,
           `Post-compaction state recovery: ${config.recoverAfterCompaction ? 'enabled' : 'disabled'} (read existing captures at safe idle).`,
-          'Integration cadence: every fifth completed checkpoint; 70% safeguard when the current compaction cycle has not completed integration.',
+          'Integration: after three completed captures, pending at five idle minutes and eligible at ten; 70% safeguard bypasses the idle delay and capture quota.',
           '', help,
         ].join('\n'));
         return;

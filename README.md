@@ -12,6 +12,7 @@ hooks, plugin manifest, custom MCP server, bundled skill, or model client.
 - PowerShell 7 only when using the legacy PowerShell installation commands.
 - A working **local** Basic Memory MCP server available to Copilot.
 - The upstream Basic Memory `memory-capture` skill installed and enabled.
+- The upstream `memory-integrate` skill permitting user-configured automatic integration.
 - Experimental Copilot CLI extensions enabled with `--experimental`.
 
 Verified against Copilot CLI **1.0.93-2**, PowerShell **7.4.20**, and local
@@ -37,7 +38,7 @@ From a published revision, install or update in one command without maintaining
 a source checkout:
 
 ```powershell
-npx github:joniba/basic-memory-copilot-bridge --update
+npx --yes "github:joniba/basic-memory-copilot-bridge#main" --update
 ```
 
 The package has an npm executable entry and a strict asset allowlist. npm may
@@ -60,10 +61,10 @@ the installer alone uses a JSONC parser.
 
 ```powershell
 # Native extension only; an existing companion is left untouched:
-npx github:joniba/basic-memory-copilot-bridge --update --no-statusline
+npx --yes "github:joniba/basic-memory-copilot-bridge#main" --update --no-statusline
 
 # Independent token/status companion only:
-npx github:joniba/basic-memory-copilot-bridge --update --statusline-only
+npx --yes "github:joniba/basic-memory-copilot-bridge#main" --update --statusline-only
 ```
 
 Use `--copilot-home` with an absolute path to select another destination;
@@ -72,24 +73,17 @@ The installer refuses symlinked managed paths and ambiguous existing compositor
 wiring rather than risking a recursive wrapper or overwriting another location.
 It never logs the saved previous command.
 
-### Share a feature branch or pinned revision
+### Share a feature branch
 
 npm Git selectors make published in-progress features installable without a clone:
 
 ```powershell
-npx "github:joniba/basic-memory-copilot-bridge#feature/npx-installation" --update
+npx --yes "github:joniba/basic-memory-copilot-bridge#feature/idle-memory-integration" --update
 ```
 
-For reproducible testing, prefer an exact published commit over a moving branch:
-
-```powershell
-$repo = 'github:joniba/basic-memory-copilot-bridge'
-$revision = '<full-commit-sha>'
-npx "$repo#$revision" --update
-```
-
-Only published refs can be fetched from GitHub. npm can cache Git package
-resolutions, so pin the requested commit when exchanging a specific candidate.
+Use branch names in installation commands. Record the resolved revision separately
+when verifying a candidate; npm can cache Git package resolutions.
+Only published refs can be fetched from GitHub.
 This package is distributed from GitHub, not published to the npm registry.
 
 ### From a checkout or extracted ZIP
@@ -133,38 +127,60 @@ there is no byte fallback. Compaction resets context baselines, and a missed
 pre-compaction opportunity does not schedule a recovery capture afterward.
 Capture before every compaction is not guaranteed.
 
-### Integration checkpoints
+### Idle integration and pressure safeguard
 
-Every **fifth completed checkpoint** uses the installed `memory-integrate` skill
-instead of `memory-capture`: checkpoints 5, 10, 15, and so on. Integration updates
-canonical topic notes rather than creating another large session-summary note.
-The completion count persists across resume and compaction. Existing sessions
-start counting prospectively when upgraded; old checkpoint history is preserved,
-not reconstructed from logs.
+Capture checkpoints keep their existing token/time gates and always use
+`memory-capture`. Integration is separate maintenance using `memory-integrate`,
+not a replacement capture or another large session-summary note.
+
+After **three completed capture checkpoints since the last completed integration**,
+five continuous idle minutes show a yellow **`integration pending`** label.
+At ten continuous idle minutes the bridge can queue integration, after checking
+that nothing else is processing, active or queued. One non-overlapping check runs
+about every 30 seconds; timing is approximate and there is no live countdown.
+Three captures are also required before the first non-pressure integration.
+
+Foreground activity clears the pending label and restarts the waiting period.
+Reload, compaction, errors and long scheduling gaps (such as laptop sleep) restart
+the idle clock rather than catching up immediately. Idle timing is not persisted.
+An ordinary integration gets only one submission attempt per idle stretch;
+failure, cancellation or ambiguous delivery does not cause automatic retries.
+Subsequent foreground activity permits a new ordinary idle attempt.
 
 If the current compaction cycle has completed no integration and native usage
 reaches **70%**, an additional integration becomes eligible at safe idle after the
-existing five-minute pressure gap. It is independent of the periodic token
-interval and can still occur after the cycle's normal 65% pressure checkpoint.
-Compaction resets the integration safeguard, not the fifth-checkpoint count.
+existing five-minute pressure gap, bypassing the idle delay and three-capture
+quota. It is independent of the periodic token interval and remains available
+after the cycle's normal 65% pressure checkpoint.
+Compaction resets the integration safeguard, not the capture quota.
 An already-high post-compaction baseline is included. If a capture or recovery
 finishes above 70%, that safe idle can admit the required integration after the
 pressure gap; it does not automatically chain ordinary periodic captures.
-Accepted integration pressure attempts are coalesced and are not immediately
-repeated after an abort; ordinary checkpoint send failures retain their bounded
-retry behavior.
+Pressure attempts are reserved once per epoch before submission, so failure or
+ambiguous delivery does not cause repeated pressure integration sends.
 
-The status line adds **`(integration)`**, with the word in yellow, to the
-next-checkpoint target/countdown or queued/in-progress checkpoint when that action
-will integrate. Ordinary checkpoint text and percentage warnings keep their
-existing colors. The timeline says `Memory integration queued`.
+Integration completion resets the three-capture quota, including pressure
+integration. Integration never advances capture history, resets capture
+watermarks/cooldowns or consumes the ordinary pressure-capture opportunity.
+Its actual native token usage is counted normally; no token compensation is
+performed. Thus a normal capture may still become due after integration.
 
-Only bridge-requested, started, non-aborted checkpoint turns observed finishing
-advance this count. Recovery turns and unconfirmed/cancelled requests do not.
+Only bridge-requested, started, non-aborted capture turns observed finishing
+advance the capture count. Recovery, integration and unconfirmed/cancelled turns
+do not. The count and last-integrated capture count persist across reload and
+compaction. Legacy sessions start counting captures prospectively without
+reconstructing the old mixed capture/integration cadence.
 A completed integration turn counts even if there was no useful new knowledge
 and no note changes; it does not prove successful corpus mutation. Manual
 integrations outside the bridge are not tracked. Historical `last checkpoint`
-still describes a checkpoint turn, not proof of a saved session capture.
+still describes a capture-checkpoint turn, not proof of a saved session capture.
+
+The status line shows a separate yellow `integration pending` label and then
+`memory integration: queued` / `in progress`, preserving checkpoint history and
+independent percentage warnings. The timeline says `Memory integration queued`.
+Checking idle and submitting work are separate operations: new user work can
+arrive between them, leaving integration queued behind it. This accepted timing
+race has no extra prevention, cancellation or recovery machinery.
 
 The installed `memory-integrate` skill must allow user-configured checkpoint
 integration. npx does not install or rewrite skills or the MCP server. Integration

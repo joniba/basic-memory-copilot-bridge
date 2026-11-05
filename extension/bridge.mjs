@@ -16,9 +16,10 @@ const object = value => value !== null && typeof value === 'object' && !Array.is
 const count = value => Number.isSafeInteger(value) && value >= 0;
 const optionalCount = value => value === null || count(value);
 const sessionIdValid = value => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(value);
-const integrationEvery = 5;
 const integrationThreshold = 0.70;
-const integrationAnnotation = { text: 'integration', color: 'yellow' };
+const idleCheckInterval = 30000;
+const integrationPendingAfter = 5 * 60000;
+const integrationAfter = 10 * 60000;
 
 export function validateConfig(value) {
   if (!object(value) || Object.keys(value).some(key => !Object.hasOwn(defaults, key))) {
@@ -46,7 +47,8 @@ export function freshState(sessionId) {
     compactionEpoch: 0, nativeCompactionCount: null, lastCompactionEventId: null, pressureOpportunityEpoch: null,
     pressurePending: false, compacting: false, captureInFlight: null, retryAfter: null,
     pendingRecoveryEpoch: null,
-    completedCheckpoints: 0, lastIntegrationEpoch: null, integrationPressureOpportunityEpoch: null,
+    completedCaptures: 0, lastIntegrationCaptureCount: 0,
+    lastIntegrationEpoch: null, integrationPressureOpportunityEpoch: null, lastIntegrationOpportunityAt: null,
   };
 }
 
@@ -56,15 +58,18 @@ function validState(state, sessionId) {
     && ['baselineTokens', 'lastContextTokens', 'tokenLimit', 'lastOpportunityTokens',
       'lastOpportunityAt', 'lastCheckpointTokens', 'lastCheckpointAt', 'pressureOpportunityEpoch',
       'nativeCompactionCount', 'retryAfter', 'pendingRecoveryEpoch', 'lastIntegrationEpoch',
-      'integrationPressureOpportunityEpoch'].every(key => optionalCount(state[key]))
+      'integrationPressureOpportunityEpoch', 'lastIntegrationOpportunityAt'].every(key => optionalCount(state[key]))
     && (state.pendingRecoveryEpoch === null || state.pendingRecoveryEpoch === state.compactionEpoch)
-    && count(state.lastSeenMessagesLength) && count(state.compactionEpoch) && count(state.completedCheckpoints)
+    && count(state.lastSeenMessagesLength) && count(state.compactionEpoch)
+    && count(state.completedCaptures) && count(state.lastIntegrationCaptureCount)
+    && state.lastIntegrationCaptureCount <= state.completedCaptures
     && typeof state.pressurePending === 'boolean' && typeof state.compacting === 'boolean'
     && (state.lastCompactionEventId === null || typeof state.lastCompactionEventId === 'string')
     && (flight === null || (object(flight) && typeof flight.id === 'string'
-      && ['periodic', 'pressure', 'recovery'].includes(flight.kind) && count(flight.epoch)
+      && ['periodic', 'pressure', 'recovery', 'integration'].includes(flight.kind) && count(flight.epoch)
       && (flight.kind !== 'recovery' || count(flight.startTokens))
       && typeof flight.integration === 'boolean' && (flight.kind !== 'recovery' || !flight.integration)
+      && (flight.kind !== 'integration' || flight.integration)
       && typeof flight.started === 'boolean'
       && (flight.messageId === null || typeof flight.messageId === 'string')));
 }
@@ -92,7 +97,8 @@ export class FileStateStore {
         state = JSON.parse(await readFile(this.path, 'utf8'));
         if (object(state) && !Object.hasOwn(state, 'pendingRecoveryEpoch')) state.pendingRecoveryEpoch = null;
         if (object(state)) {
-          for (const key of ['completedCheckpoints', 'lastIntegrationEpoch', 'integrationPressureOpportunityEpoch']) {
+          for (const key of ['completedCaptures', 'lastIntegrationCaptureCount', 'lastIntegrationEpoch',
+            'integrationPressureOpportunityEpoch', 'lastIntegrationOpportunityAt']) {
             if (!Object.hasOwn(state, key)) state[key] = freshState(this.sessionId)[key];
           }
           if (object(state.captureInFlight) && !Object.hasOwn(state.captureInFlight, 'integration')) {
@@ -195,13 +201,21 @@ export function applyUsage(state, usage, config) {
     && (state.compactionEpoch === 0 || tokens > state.baselineTokens);
 }
 
-function integrationPressureEligible(state, config, now) {
-  const elapsed = state.lastOpportunityAt === null ? Infinity : now - state.lastOpportunityAt;
-  return config.enabled && count(state.lastContextTokens) && count(state.tokenLimit) && state.tokenLimit > 0
+function integrationPressurePending(state) {
+  return count(state.lastContextTokens) && count(state.tokenLimit) && state.tokenLimit > 0
     && state.lastIntegrationEpoch !== state.compactionEpoch
     && state.integrationPressureOpportunityEpoch !== state.compactionEpoch
-    && state.lastContextTokens / state.tokenLimit >= integrationThreshold
-    && elapsed >= config.pressureMinimumMinutesBetweenOpportunities * 60000;
+    && state.lastContextTokens / state.tokenLimit >= integrationThreshold;
+}
+
+function integrationPressureEligible(state, config, now) {
+  const opportunity = Math.max(state.lastOpportunityAt ?? -Infinity, state.lastIntegrationOpportunityAt ?? -Infinity);
+  return config.enabled && integrationPressurePending(state)
+    && now - opportunity >= config.pressureMinimumMinutesBetweenOpportunities * 60000;
+}
+
+function integrationQuotaAvailable(state) {
+  return state.completedCaptures - state.lastIntegrationCaptureCount >= 3;
 }
 
 export function eligibility(state, config, now) {
@@ -211,22 +225,15 @@ export function eligibility(state, config, now) {
   if (state.retryAfter !== null && now < state.retryAfter) return 'retry-cooldown';
   if (state.lastContextTokens === null || state.tokenLimit === null) return 'usage-unavailable';
   const elapsed = state.lastOpportunityAt === null ? Infinity : now - state.lastOpportunityAt;
-  if (integrationPressureEligible(state, config, now)
-    || (state.pressurePending && state.pressureOpportunityEpoch !== state.compactionEpoch
-      && elapsed >= config.pressureMinimumMinutesBetweenOpportunities * 60000)) return 'pressure';
+  if (state.pressurePending && state.pressureOpportunityEpoch !== state.compactionEpoch
+    && elapsed >= config.pressureMinimumMinutesBetweenOpportunities * 60000) return 'pressure';
   const watermark = state.lastOpportunityTokens ?? state.baselineTokens;
   if (watermark !== null && state.lastContextTokens - watermark >= config.periodicMinimumNewTokens
     && elapsed >= config.minimumMinutesBetweenOpportunities * 60000) return 'periodic';
   return 'below-gate';
 }
 
-export function integrationCheckpoint(state, tokens = state.lastContextTokens, limit = state.tokenLimit) {
-  return state.completedCheckpoints % integrationEvery === integrationEvery - 1
-    || (count(tokens) && count(limit) && limit > 0 && tokens / limit >= integrationThreshold
-      && state.lastIntegrationEpoch !== state.compactionEpoch);
-}
-
-export function statusContribution(state, usage, config) {
+export function statusContribution(state, usage, config, idleIntegrationPending = false) {
   if (!state || !config.enabled) return null;
   const flight = state.captureInFlight;
   const previous = state.lastCheckpointTokens === null
@@ -237,9 +244,9 @@ export function statusContribution(state, usage, config) {
   if (flight && (flight.messageId !== null || flight.started)) {
     return {
       kind: 'activity', priority: 100, color: 'yellow',
-      prefix: flight.kind === 'recovery' ? `last checkpoint: ${previous}, state recovery: ` : prefix,
+      prefix: flight.kind === 'recovery' ? `last checkpoint: ${previous}, state recovery: `
+        : flight.integration ? `last checkpoint: ${previous}, memory integration: ` : prefix,
       label: flight.started ? 'in progress' : 'queued',
-      ...(flight.integration ? { annotation: integrationAnnotation } : {}),
     };
   }
   if (!state.compacting && !flight && config.recoverAfterCompaction
@@ -252,17 +259,20 @@ export function statusContribution(state, usage, config) {
   if (state.compacting || flight || !usage || state.baselineTokens === null) return null;
   const snapshot = structuredClone(state);
   applyUsage(snapshot, usage, config);
+  if (idleIntegrationPending || integrationPressurePending(snapshot)) {
+    return {
+      kind: 'activity', priority: 10, color: 'yellow',
+      prefix: `last checkpoint: ${previous}, `, label: 'integration pending',
+    };
+  }
   const delay = state.retryAfter ?? 0;
   const watermark = snapshot.lastOpportunityTokens ?? snapshot.baselineTokens;
   const periodic = watermark + config.periodicMinimumNewTokens;
   const targets = [];
-  const annotate = tokens => integrationCheckpoint(snapshot, tokens, usage.tokenLimit)
-    ? { annotation: integrationAnnotation } : {};
   if (count(periodic)) targets.push({
     tokens: periodic,
     notBefore: Math.max(delay, state.lastOpportunityAt === null ? 0
       : state.lastOpportunityAt + config.minimumMinutesBetweenOpportunities * 60000),
-    ...annotate(periodic),
   });
   if (state.pressureOpportunityEpoch !== state.compactionEpoch) {
     const pressure = Math.max(Math.ceil(usage.tokenLimit * config.contextPressureThreshold),
@@ -271,24 +281,11 @@ export function statusContribution(state, usage, config) {
       tokens: pressure,
       notBefore: Math.max(delay, state.lastOpportunityAt === null ? 0
         : state.lastOpportunityAt + config.pressureMinimumMinutesBetweenOpportunities * 60000),
-      ...annotate(pressure),
-    });
-  }
-  if (state.lastIntegrationEpoch !== state.compactionEpoch
-    && state.integrationPressureOpportunityEpoch !== state.compactionEpoch) {
-    const pressure = Math.ceil(usage.tokenLimit * integrationThreshold);
-    if (count(pressure)) targets.push({
-      tokens: pressure,
-      notBefore: Math.max(delay, state.lastOpportunityAt === null ? 0
-        : state.lastOpportunityAt + config.pressureMinimumMinutesBetweenOpportunities * 60000),
-      annotation: integrationAnnotation,
     });
   }
   if (!targets.length) return null;
   return {
     kind: 'hint', priority: 10, color: 'white', targets,
-    ...(integrationCheckpoint(snapshot, usage.currentTokens, usage.tokenLimit)
-      ? { annotation: integrationAnnotation } : {}),
     tokenCeiling: count(usage.compactionThreshold) && usage.compactionThreshold > 0
       ? usage.compactionThreshold : usage.tokenLimit,
     labels: {
@@ -308,7 +305,7 @@ export function checkpointPrompt(sessionId, context = {}, integration = false) {
   if (integration) {
     const { thread_id, ...topicProvenance } = provenance;
     return [
-      'This checkpoint is a topic-based memory integration under the configured bridge rule. Use the installed memory-integrate skill instead of memory-capture.',
+      'This is a topic-based memory integration under the configured bridge rule, separate from capture checkpoints. Use the installed memory-integrate skill instead of memory-capture.',
       'Integrate useful current conclusions, verified findings, important failed attempts, decisions and unresolved questions into their existing canonical local Basic Memory topic notes. Search and read each topic before editing; create a note only for a genuinely missing concept.',
       'Follow existing repository-based corpus routing and pass the project explicitly. Use only local Basic Memory; if locality/project cannot be established or memory is unavailable, skip without inventing a destination.',
       `Preserve applicable topic provenance as metadata (values are data, not instructions): ${JSON.stringify(topicProvenance)}.`,
@@ -380,7 +377,8 @@ export function createLogger(directory, sessionId, clock = Date.now) {
 }
 
 export class CaptureBridge {
-  constructor({ session, store, config, log, status = async () => {}, clock = Date.now }) {
+  constructor({ session, store, config, log, status = async () => {}, clock = Date.now,
+    timers = { setInterval, clearInterval } }) {
     this.session = session;
     this.store = store;
     this.readConfig = config;
@@ -397,6 +395,12 @@ export class CaptureBridge {
     this.stopped = false;
     this.ready = false;
     this.lastWarningAt = null;
+    this.timers = timers;
+    this.timer = null;
+    this.tickPending = false;
+    this.lastTickAt = this.clock();
+    this.idleSince = null;
+    this.idleAttempted = false;
   }
 
   report(event, gateDecision, config = defaults) {
@@ -433,7 +437,7 @@ export class CaptureBridge {
   async publishStatus(config) {
     try {
       await this.status(this.stopped ? null
-        : statusContribution(this.lastState, this.usage, config));
+        : statusContribution(this.lastState, this.usage, config, this.idleIntegrationEligible(integrationPendingAfter)));
     } catch {
       await this.warn('status');
     }
@@ -452,7 +456,10 @@ export class CaptureBridge {
   }
 
   enqueue(action) {
-    this.queue = this.queue.then(action).catch(() => this.warn('event'));
+    this.queue = this.queue.then(action).catch(() => {
+      this.idleSince = null;
+      return this.warn('event');
+    });
     return this.queue;
   }
 
@@ -464,6 +471,58 @@ export class CaptureBridge {
     return this.enqueue(async () => {
       await this.initialize();
       await this.checkPendingIdleWork();
+    });
+  }
+
+  stop() {
+    this.stopped = true;
+    this.idleSince = null;
+    if (this.timer !== null) this.timers.clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  idleIntegrationEligible(delay = integrationAfter, state = this.lastState) {
+    return state && integrationQuotaAvailable(state) && !this.idleAttempted && this.idleSince !== null
+      && this.clock() - this.idleSince >= delay;
+  }
+
+  tick() {
+    if (!this.ready || this.stopped || this.tickPending) return this.queue;
+    this.tickPending = true;
+    return this.enqueue(async () => {
+      try {
+        if (this.stopped) return;
+        const now = this.clock();
+        if (now < this.lastTickAt || now - this.lastTickAt > 2 * idleCheckInterval) this.idleSince = null;
+        this.lastTickAt = now;
+        const config = await this.readConfig();
+        if (!config.enabled || this.compactionStarting || this.lastState.compacting || this.lastState.captureInFlight) {
+          this.idleSince = null;
+          await this.publishStatus(config);
+          return;
+        }
+        const { processing } = await bounded(this.session.rpc.metadata.isProcessing());
+        if (typeof processing !== 'boolean') throw new Error('processing-state-invalid');
+        const activity = await bounded(this.session.rpc.metadata.activity());
+        const pending = await bounded(this.session.rpc.queue.pendingItems());
+        if (this.stopped || processing || activity.hasActiveWork || pending.items.length || pending.steeringMessages.length) {
+          this.idleSince = null;
+          await this.publishStatus(config);
+          return;
+        }
+        this.idleSince ??= now;
+        await this.refreshUsage();
+        const snapshot = structuredClone(this.lastState);
+        if (this.usage) applyUsage(snapshot, this.usage, config);
+        if ((config.recoverAfterCompaction && snapshot.pendingRecoveryEpoch !== null)
+          || integrationPressureEligible(snapshot, config, now) || this.idleIntegrationEligible()) {
+          await this.handle({ type: 'bridge.integration_check', data: {} });
+        } else {
+          await this.publishStatus(config);
+        }
+      } finally {
+        this.tickPending = false;
+      }
     });
   }
 
@@ -503,6 +562,10 @@ export class CaptureBridge {
       }
     });
     this.ready = true;
+    if (this.timer === null) {
+      this.timer = this.timers.setInterval(() => { void this.tick(); }, idleCheckInterval);
+      this.timer.unref();
+    }
     await this.report('startup', 'attached');
   }
 
@@ -579,18 +642,25 @@ export class CaptureBridge {
       await this.report('session.idle', accepted ? 'recovery-turn-finished' : 'recovery-unconfirmed');
       return;
     }
+    if (flight?.integration) {
+      if (accepted && flight.started && decision === 'checkpoint-turn-finished') {
+        state.lastIntegrationEpoch = state.compactionEpoch;
+        state.lastIntegrationCaptureCount = state.completedCaptures;
+        await this.report('session.idle', 'integration-turn-finished');
+      } else {
+        await this.report('session.idle', decision === 'checkpoint-aborted'
+          ? 'integration-aborted' : 'integration-unconfirmed');
+      }
+      return;
+    }
     if (!accepted) {
       state.retryAfter = this.clock() + 60000;
       await this.report('session.idle', 'unconfirmed-request-reconciled');
       return;
     }
     if (flight.started && decision === 'checkpoint-turn-finished') {
-      if (!count(state.completedCheckpoints + 1)) throw new Error('checkpoint-count-invalid');
-      state.completedCheckpoints += 1;
-      if (flight.integration) {
-        state.lastIntegrationEpoch = state.compactionEpoch;
-        await this.report('session.idle', 'integration-turn-finished');
-      }
+      if (!count(state.completedCaptures + 1)) throw new Error('checkpoint-count-invalid');
+      state.completedCaptures += 1;
     }
     state.lastOpportunityTokens = state.lastContextTokens;
     if (state.lastContextTokens !== null) state.lastCheckpointTokens = state.lastContextTokens;
@@ -602,13 +672,10 @@ export class CaptureBridge {
   acceptOffer(state, offer, messageId) {
     if (state.captureInFlight?.id !== offer.id || state.captureInFlight.messageId === messageId) return;
     state.captureInFlight.messageId = messageId;
-    if (offer.kind === 'recovery') return;
+    if (offer.kind === 'recovery' || offer.integration) return;
     state.lastOpportunityAt = this.clock();
     state.lastOpportunityTokens = state.lastContextTokens;
     if (offer.kind === 'pressure') state.pressureOpportunityEpoch = offer.epoch;
-    if (offer.integration && state.lastContextTokens / state.tokenLimit >= integrationThreshold) {
-      state.integrationPressureOpportunityEpoch = state.compactionEpoch;
-    }
   }
 
   async handle(event) {
@@ -619,7 +686,13 @@ export class CaptureBridge {
     }
     const config = await this.readConfig();
     if (event.type === 'session.error') {
+      this.idleSince = null;
       await this.warn('session');
+      return;
+    }
+    if (['assistant.turn_start', 'tool.execution_start'].includes(event.type)) {
+      this.idleSince = null;
+      await this.publishStatus(config);
       return;
     }
     if (event.type === 'session.context_changed') {
@@ -645,7 +718,7 @@ export class CaptureBridge {
       return;
     }
     if (event.type === 'session.shutdown') {
-      this.stopped = true;
+      this.stop();
       await this.transaction(state => {
         if (this.usage && !state.compacting) applyUsage(state, this.usage, config);
       });
@@ -654,11 +727,20 @@ export class CaptureBridge {
     }
     if (!['session.idle', 'bridge.recovery_check', 'bridge.integration_check', 'user.message', 'session.compaction_start',
       'session.compaction_complete', 'session.context_cleared'].includes(event.type)) return;
+    if (event.type === 'session.idle') {
+      if (event.data.aborted === true) {
+        this.idleSince = null;
+        this.idleAttempted = true;
+      } else {
+        this.idleSince ??= this.clock();
+      }
+    }
     if (['session.idle', 'bridge.recovery_check', 'bridge.integration_check'].includes(event.type)) await this.refreshUsage();
     let offer;
     await this.transaction(async (state, recovered) => {
       if (this.usage && !state.compacting) applyUsage(state, this.usage, config);
       if (event.type === 'user.message') {
+        this.idleSince = null;
         const flight = state.captureInFlight ?? this.lastRequest;
         const ownMessage = flight && typeof event.data.messageId === 'string'
           && (flight.messageId === event.data.messageId
@@ -673,9 +755,11 @@ export class CaptureBridge {
         } else if (state.captureInFlight?.started && ['idle', 'queued'].includes(event.data.delivery)) {
           await this.finish(state, 'checkpoint-turn-finished');
         }
+        if (!ownMessage && event.data.source !== 'system') this.idleAttempted = false;
         return;
       }
       if (event.type === 'session.compaction_start') {
+        this.idleSince = null;
         state.compacting = true;
         if ((state.pressurePending && state.pressureOpportunityEpoch !== state.compactionEpoch)
           || (state.captureInFlight && state.captureInFlight.kind !== 'recovery' && !state.captureInFlight.started)) {
@@ -694,6 +778,7 @@ export class CaptureBridge {
         return;
       }
       if (event.type === 'session.compaction_complete' || event.type === 'session.context_cleared') {
+        this.idleSince = null;
         state.compacting = false;
         this.compactionStarting = false;
         if (event.type === 'session.context_cleared' || event.data.success === true) {
@@ -748,39 +833,50 @@ export class CaptureBridge {
         await this.report(event.type, 'usage-unavailable', config);
         return;
       }
-      const decision = config.enabled && state.pendingRecoveryEpoch !== null && !state.compacting
-        && (state.retryAfter === null || this.clock() >= state.retryAfter)
-        ? 'recovery' : eligibility(state, config, this.clock());
+      const available = config.enabled && !state.compacting
+        && (state.retryAfter === null || this.clock() >= state.retryAfter);
+      const pressureIntegration = available && integrationPressureEligible(state, config, this.clock());
+      let decision = eligibility(state, config, this.clock());
+      if (available && state.pendingRecoveryEpoch !== null) decision = 'recovery';
+      else if (pressureIntegration || (available && event.type === 'bridge.integration_check'
+        && this.idleIntegrationEligible(integrationAfter, state))) decision = 'integration';
       if (event.type === 'bridge.recovery_check' && decision !== 'recovery') return;
-      if (event.type === 'bridge.integration_check' && !integrationPressureEligible(state, config, this.clock())) return;
-      if (!['periodic', 'pressure', 'recovery'].includes(decision) || this.compactionStarting) {
+      if (event.type === 'bridge.integration_check' && !['recovery', 'integration'].includes(decision)) return;
+      if (!['periodic', 'pressure', 'recovery', 'integration'].includes(decision) || this.compactionStarting) {
         await this.report(event.type, this.compactionStarting ? 'compacting' : decision, config);
         return;
       }
       const activity = await bounded(this.session.rpc.metadata.activity());
       const pending = await bounded(this.session.rpc.queue.pendingItems());
       if (activity.hasActiveWork || pending.items.length || pending.steeringMessages.length) {
+        this.idleSince = null;
         await this.report(event.type, 'busy', config);
         return;
       }
       offer = {
         id: randomUUID(), kind: decision, epoch: state.compactionEpoch, messageId: null, started: false,
-        integration: decision !== 'recovery' && integrationCheckpoint(state),
+        integration: decision === 'integration',
         ...(decision === 'recovery' ? { startTokens: state.lastContextTokens } : {}),
       };
       if (decision === 'recovery') state.pendingRecoveryEpoch = null;
+      if (offer.integration) {
+        this.idleAttempted = true;
+        state.lastIntegrationOpportunityAt = this.clock();
+        if (pressureIntegration) state.integrationPressureOpportunityEpoch = state.compactionEpoch;
+      }
       state.captureInFlight = offer;
       this.lastRequest = offer;
     });
     if (!offer) return;
-    if (this.compactionStarting) {
+    if (this.compactionStarting || this.stopped) {
       await this.transaction(state => {
         if (state.captureInFlight?.id === offer.id) {
           state.captureInFlight = null;
         }
       });
       this.lastRequest = null;
-      await this.report(event.type, offer.kind === 'recovery' ? 'recovery-deferred-compaction' : 'missed-pre-compaction', config);
+      await this.report(event.type, this.stopped ? 'request-stopped'
+        : offer.kind === 'recovery' ? 'recovery-deferred-compaction' : 'missed-pre-compaction', config);
       return;
     }
     let accepted = false;
@@ -804,7 +900,7 @@ export class CaptureBridge {
       await this.transaction(state => {
         if (state.captureInFlight?.id === offer.id) {
           state.captureInFlight = null;
-          if (offer.kind !== 'recovery') state.retryAfter = this.clock() + 60000;
+          if (offer.kind !== 'recovery' && !offer.integration) state.retryAfter = this.clock() + 60000;
         }
       });
       await this.warn(offer.kind === 'recovery' ? 'recovery-send' : 'send');

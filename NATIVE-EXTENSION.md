@@ -116,25 +116,36 @@ substitute for testing a long-running interactive session.
 
 ## State, diagnostics, and disable
 
-### Integration cadence and pressure safeguard
+### Idle integration and pressure safeguard
 
-The bridge selects `memory-integrate` for every fifth completed checkpoint, with
-a persistent count across compaction and reload. The counter starts at zero for
-legacy state without this metadata, preserving existing history and time gates.
-An integration replaces a capture; it does not additionally create a session
-capture. Only a correlated, started, non-aborted checkpoint turn observed
-finishing increments the count. Reconciled unknown completions, cancelled
-requests and read-only recovery do not count.
+Capture checkpoints always use `memory-capture`, retaining their original
+eligibility, opportunity clocks and history. Separate integration uses
+`memory-integrate` after three completed captures since the last completed
+integration, including three captures before its first ordinary idle run.
+Only correlated, started, non-aborted capture turns observed finishing advance
+this quota. Recovery and integration do not count as captures.
+
+The bridge owns one unref'd 30-second interval, coalesces overlapping ticks, and
+serializes checks through its existing event queue. Native processing, activity
+and pending/steering queues must all be empty. After five confirmed idle minutes
+the static pending label is yellow; after ten, integration may be admitted.
+Repeated idle/usage notifications do not restart the clock; foreground messages
+and actual work do. Idle timing is memory-only and restarts after reload,
+compaction, errors, backward clock movement or a tick gap over 60 seconds.
+No deadline catch-up, live countdown or per-second polling is implemented.
+Ordinary integration is attempted once per idle stretch, including failed or
+ambiguous submissions. Only subsequent foreground activity rearms that attempt.
+Shutdown and termination clear the interval.
 
 A completed integration marks the current compaction epoch as integrated, even
 if the agent reported no useful changes. This is turn-completion accounting,
 not verification that topic notes were updated. Manual integrations outside the
 bridge are not detectable by this rule. If the current epoch has no completed
 integration, usage at or above 70% can admit an extra integration checkpoint at
-safe idle, subject to the existing five-minute opportunity gap and all
+safe idle, bypassing the idle delay and capture quota but retaining the five-minute opportunity gap and all
 active/queued-work, usage, retry and compaction guards. This remains available
-after an earlier normal pressure checkpoint. Its accepted pressure attempt is
-recorded separately to prevent immediate repeated integrations after an abort.
+after an earlier normal pressure checkpoint. Its pressure attempt is
+reserved before submission to prevent repeats after failure or ambiguous delivery.
 The 70% safeguard also applies when compaction leaves an already-high baseline;
 it does not require additional token growth. A capture or recovery turn finishing
 at safe idle may admit this eligible integration, subject to the pressure gap,
@@ -144,11 +155,20 @@ check to admit only an eligible integration (`bridge.integration_check`) when
 there is no pending read-only recovery. The check still revalidates usage,
 activity and queued work, and never starts a normal periodic capture.
 
-`completedCheckpoints`, `lastIntegrationEpoch` and
-`integrationPressureOpportunityEpoch` are bounded operational state, not note
-contents. Each checkpoint reservation freezes its `integration` action flag.
-The next target and active label carry a generic yellow `integration` annotation
-without changing the renderer's provider-independent scheduling contract.
+`completedCaptures`, `lastIntegrationCaptureCount`, `lastIntegrationEpoch`,
+`integrationPressureOpportunityEpoch` and `lastIntegrationOpportunityAt` are
+bounded operational state, not note contents. Legacy mixed checkpoint counts
+are not treated as captures; missing quota fields start at zero without
+discarding capture history. Existing legacy in-flight integrations remain
+correlatable. Integration completion updates the quota and epoch only, not
+capture watermarks/history; its native token overhead is not subtracted.
+Capture opportunity clocks and the separate integration opportunity timestamp
+jointly enforce the integration pressure gap.
+
+The generic activity protocol already supports the yellow pending/active label;
+the renderer needs no new timing logic. The accepted check-idle/send race is
+unchanged: newly arriving work may leave integration in the normal queue behind
+it. No queue cancellation or extra race-management mechanism is added.
 
 The integration prompt requires the installed topic-based `memory-integrate`
 skill, a correctly routed local project, canonical-note searches before edits,
