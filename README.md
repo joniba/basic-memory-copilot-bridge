@@ -6,6 +6,9 @@ Memory `memory-capture` skill performs any actual writing. The extension
 uses native context information, not transcript bytes, and adds no shell
 hooks, plugin manifest, custom MCP server, bundled skill, or model client.
 
+For the cumulative stabilization fixes on this branch, see the
+[release notes](RELEASE-NOTES.md).
+
 ## Requirements
 
 - Node.js 20 or newer (tested with 24.16.0), Git, and GitHub Copilot CLI.
