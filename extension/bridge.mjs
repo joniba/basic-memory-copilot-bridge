@@ -19,7 +19,7 @@ const sessionIdValid = value => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-
 const failureOperations = new WeakMap();
 const diagnosticOperations = new Set([
   'config.read', 'diagnostic.write', 'metadata.snapshot', 'metadata.context-info',
-  'metadata.context-attribution', 'metadata.activity', 'metadata.is-processing',
+  'metadata.activity', 'metadata.is-processing',
   'queue.pending-items', 'queue.remove', 'session.send', 'session.log', 'status.publish',
   'state.transaction', 'state.mkdir', 'state.lock-acquire', 'state.stat', 'state.read',
   'state.legacy-read', 'state.write-temp', 'state.replace', 'state.temp-cleanup',
@@ -358,7 +358,8 @@ export function createLogger(directory, sessionId, clock = Date.now) {
   return async record => {
     const now = clock();
     const diagnostic = record.operation === undefined ? {} : diagnosticFields(record);
-    const key = JSON.stringify([record.event, record.gateDecision, diagnostic]);
+    const key = JSON.stringify([record.event, record.gateDecision, diagnostic,
+      count(record.compactionEpoch) ? record.compactionEpoch : null]);
     if (recent.has(key) && now - recent.get(key) < 60000) return;
     recent.set(key, now);
     if (recent.size > 32) recent.delete(recent.keys().next().value);
@@ -373,6 +374,9 @@ export function createLogger(directory, sessionId, clock = Date.now) {
       gateDecision: record.gateDecision,
       ...(Number.isFinite(record.contextRatio) ? { contextRatio: record.contextRatio } : {}),
       ...(record.phase === 'initialization' || record.phase === 'event' ? { phase: record.phase } : {}),
+      ...(record.trackingMode === 'events-only' ? { trackingMode: record.trackingMode } : {}),
+      ...(count(record.compactionEpoch) ? { compactionEpoch: record.compactionEpoch } : {}),
+      ...(typeof record.recoveryPending === 'boolean' ? { recoveryPending: record.recoveryPending } : {}),
       ...diagnostic,
     })}\n`, { mode: 0o600 });
   };
@@ -476,31 +480,9 @@ export class CaptureBridge {
   async initialize() {
     const config = await this.readConfig();
     const metadata = await diagnosed('metadata.snapshot', () => bounded(this.session.rpc.metadata.snapshot()));
-    if (metadata.isRemote || (metadata.clientName && metadata.clientName !== 'copilot-cli')) {
-      this.stopped = true;
-      await this.report('startup', 'unsupported-session');
-      return;
-    }
     this.context.cwd = metadata.workingDirectory;
     await this.refreshUsage();
-    const compactions = await diagnosed('metadata.context-attribution', async () => {
-      const attribution = await bounded(this.session.rpc.metadata.getContextAttribution());
-      return attribution.contextAttribution?.compactions?.count;
-    });
     await this.transaction(async (state, recovered) => {
-      if (count(compactions)) {
-        if (state.nativeCompactionCount !== null && state.nativeCompactionCount !== compactions) {
-          const missed = compactions > state.nativeCompactionCount;
-          state.compactionEpoch += Math.max(1, compactions - state.nativeCompactionCount);
-          state.baselineTokens = null;
-          state.lastOpportunityTokens = null;
-          state.lastContextTokens = null;
-          state.pressurePending = false;
-          state.pendingRecoveryEpoch = missed && config.enabled && config.recoverAfterCompaction
-            ? state.compactionEpoch : null;
-        }
-        state.nativeCompactionCount = compactions;
-      }
       state.compacting = false;
       if (this.usage) applyUsage(state, this.usage, await this.readConfig());
       if (recovered) await this.report('startup', 'state-recovered');
@@ -511,7 +493,10 @@ export class CaptureBridge {
       }
     });
     this.ready = true;
-    await this.report('startup', 'attached');
+    await this.report('startup', 'attached', config, {
+      trackingMode: 'events-only', compactionEpoch: this.lastState.compactionEpoch,
+      recoveryPending: this.lastState.pendingRecoveryEpoch !== null,
+    });
   }
 
   on(event) {
@@ -645,6 +630,7 @@ export class CaptureBridge {
       'session.compaction_complete', 'session.context_cleared'].includes(event.type)) return;
     if (event.type === 'session.idle' || event.type === 'bridge.recovery_check') await this.refreshUsage();
     let offer;
+    let transition;
     await this.transaction(async (state, recovered) => {
       if (this.usage && !state.compacting) applyUsage(state, this.usage, config);
       if (event.type === 'user.message') {
@@ -688,9 +674,6 @@ export class CaptureBridge {
         if (event.type === 'session.context_cleared' || event.data.success === true) {
           if (state.lastCompactionEventId !== event.id) {
             state.compactionEpoch += 1;
-            if (event.type === 'session.compaction_complete' && state.nativeCompactionCount !== null) {
-              state.nativeCompactionCount += 1;
-            }
             state.lastCompactionEventId = event.id;
             state.pendingRecoveryEpoch = event.type === 'session.compaction_complete'
               && config.enabled && config.recoverAfterCompaction ? state.compactionEpoch : null;
@@ -700,9 +683,11 @@ export class CaptureBridge {
             state.tokenLimit = null;
             state.pressurePending = false;
             this.usage = null;
+            transition = event.type === 'session.context_cleared' ? 'context-cleared' : 'epoch-reset';
+          } else {
+            transition = event.type === 'session.context_cleared' ? 'duplicate-clear-ignored' : 'duplicate-compaction-ignored';
           }
-          await this.report(event.type, 'epoch-reset', config);
-        } else await this.report(event.type, 'compaction-error', config);
+        } else transition = 'compaction-error';
         return;
       }
       if (event.data.aborted === true) {
@@ -759,6 +744,12 @@ export class CaptureBridge {
       state.captureInFlight = offer;
       this.lastRequest = offer;
     });
+    if (transition) {
+      await this.report(event.type, transition, config, {
+        compactionEpoch: this.lastState.compactionEpoch,
+        recoveryPending: this.lastState.pendingRecoveryEpoch !== null,
+      });
+    }
     if (!offer) return;
     if (this.compactionStarting) {
       await this.transaction(state => {

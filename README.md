@@ -157,9 +157,11 @@ requests; `enabled: false` disables all new bridge requests. The command's
 **Current settings** view also reports this setting. Failed/subagent compactions,
 rewinds, lower context counts and explicit context clearing do not trigger it.
 
-Pending recovery survives a reload, and a native count increase can reconcile
-a compaction missed while detached. Initial attachment does not replay historical
-compactions. Multiple pending compactions coalesce into recovery for the latest
+Pending recovery survives a reload. Tracking uses successful live compaction
+events and saved per-session state, not context-attribution queries, polling or
+historical scans. Compactions while the extension is unloaded/disconnected cannot
+be observed or reconstructed and do not automatically request recovery.
+Multiple pending compactions coalesce into recovery for the latest
 epoch. There is at most one send attempt per epoch: failed or ambiguous sends
 are reported, not blindly retried. An aborted idle clears an unsent reminder.
 Once accepted, a recovery follows the normal queue/permission rules; it is not
@@ -318,8 +320,8 @@ failure behavior. This optional component does not change automatic capture.
 The updater leaves checkpoint state files byte-identical and never reloads a
 running session automatically. The native bridge separately reconciles context
 when it is attached/reloaded. Its existing policy rebases periodic watermarks
-when a native token total decreases, even if the successful compaction count is
-unchanged. That can discard accrued periodic growth and move the displayed
+when a native token total decreases without an observed compaction.
+That can discard accrued periodic growth and move the displayed
 target; retaining state files is not a guarantee of an identical forecast after
 reload. This packaging change does not alter that runtime policy or the capture
 thresholds. Opportunity timestamps and actual epoch/reset rules remain intact.

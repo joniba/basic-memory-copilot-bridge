@@ -17,7 +17,7 @@ await mkdir(artifacts, { recursive: true });
 const run = await mkdtemp(join(artifacts, 'extension-unit-'));
 const start = Date.parse('2026-10-08T10:00:00Z');
 
-async function fixture(overrides = {}, id = 'test-session') {
+async function fixture(overrides = {}, id = 'test-session', beforeStart = async () => {}) {
   const directory = await mkdtemp(join(run, 'case-'));
   const store = new FileStateStore(join(directory, 'sessions'), id);
   const sent = [];
@@ -30,7 +30,6 @@ async function fixture(overrides = {}, id = 'test-session') {
   let info = { totalTokens: 1000, limit: 200000 };
   let active = false;
   let processing = true;
-  let compactions = 0;
   let pending = [];
   const session = {
     sessionId: id,
@@ -40,7 +39,7 @@ async function fixture(overrides = {}, id = 'test-session') {
       metadata: {
         snapshot: async () => ({ workingDirectory: directory, isRemote: false, clientName: 'copilot-cli' }),
         contextInfo: async () => ({ contextInfo: info }),
-        getContextAttribution: async () => ({ contextAttribution: { compactions: { count: compactions } } }),
+        getContextAttribution: async () => { assert.fail('Attribution must never be requested.'); },
         activity: async () => ({ hasActiveWork: active }),
         isProcessing: async () => ({ processing }),
       },
@@ -55,6 +54,7 @@ async function fixture(overrides = {}, id = 'test-session') {
     status: async value => statuses.push(value), clock: () => now,
   });
   let bridge = create();
+  await beforeStart({ session, store });
   await bridge.start();
   const f = {
     directory, store, session, sent, logs, warnings, removed, statuses,
@@ -65,13 +65,128 @@ async function fixture(overrides = {}, id = 'test-session') {
     active: value => { active = value; },
     processing: value => { processing = value; },
     pending: value => { pending = value; },
-    compactions: value => { compactions = value; },
     event: async (type, data = {}, extra = {}) => bridge.on({ type, data, id: `${type}-${now}`, ...extra }),
     idle: async (aborted = false) => bridge.on({ type: 'session.idle', data: { aborted } }),
     reload: async () => { bridge = create(); await bridge.start(); },
   };
   return f;
 }
+
+test('local sessions attach regardless of telemetry client name without requesting attribution', async t => {
+  for (const clientName of ['github/cli', 'copilot-cli', 'synthetic-other-client', undefined]) {
+    await t.test(String(clientName), async () => {
+      let attributionCalls = 0;
+      const f = await fixture({}, 'test-session', async ({ session }) => {
+        session.rpc.metadata.snapshot = async () => ({
+          workingDirectory: run, isRemote: false, clientName,
+        });
+        session.rpc.metadata.getContextAttribution = async () => {
+          attributionCalls += 1;
+          throw new Error('unknown variant memory');
+        };
+      });
+      assert.equal(attributionCalls, 0);
+      assert.ok(f.logs.some(row => row.gateDecision === 'attached' && row.trackingMode === 'events-only'));
+      assert.equal(f.statuses.at(-1).kind, 'hint');
+      f.info({ totalTokens: 51000, limit: 200000 });
+      await f.idle();
+      assert.equal(f.sent.length, 1);
+      assert.equal(attributionCalls, 0);
+    });
+  }
+});
+
+test('event-only tracking preserves existing state on reload and separates successful compaction from clear and failure', async () => {
+  const f = await fixture();
+  await f.store.transaction(state => Object.assign(state, {
+    nativeCompactionCount: 7, compactionEpoch: 9, lastCompactionEventId: 'earlier',
+    lastOpportunityAt: start - 1000, lastCheckpointAt: start - 500,
+    lastCheckpointTokens: 90000, pressureOpportunityEpoch: 9,
+  }));
+  await f.reload();
+  assert.equal((await f.state()).compactionEpoch, 9);
+  assert.equal((await f.state()).nativeCompactionCount, 7);
+  await f.event('session.compaction_complete', { success: false }, { id: 'failed' });
+  assert.equal((await f.state()).compactionEpoch, 9);
+  assert.equal((await f.state()).lastCompactionEventId, 'earlier');
+  await f.event('session.compaction_complete', { success: true }, { id: 'success' });
+  const compacted = await f.state();
+  assert.equal(compacted.compactionEpoch, 10);
+  assert.equal(compacted.pendingRecoveryEpoch, 10);
+  assert.equal(compacted.nativeCompactionCount, 7, 'Unused historical field remains untouched.');
+  assert.equal(compacted.lastOpportunityAt, start - 1000);
+  assert.equal(compacted.lastCheckpointAt, start - 500);
+  assert.equal(compacted.lastCheckpointTokens, 90000);
+  assert.equal(compacted.pressureOpportunityEpoch, 9);
+  await f.reload();
+  await f.event('session.compaction_complete', { success: true }, { id: 'success' });
+  assert.equal((await f.state()).compactionEpoch, 10);
+  assert.equal((await f.state()).pendingRecoveryEpoch, 10);
+  await f.event('session.context_cleared', {}, { id: 'clear' });
+  assert.equal((await f.state()).compactionEpoch, 11);
+  assert.equal((await f.state()).pendingRecoveryEpoch, null);
+  assert.equal((await f.state()).nativeCompactionCount, 7);
+  assert.ok(f.logs.some(row => row.gateDecision === 'compaction-error' && row.compactionEpoch === 9));
+  assert.ok(f.logs.some(row => row.gateDecision === 'epoch-reset' && row.compactionEpoch === 10 && row.recoveryPending));
+  assert.ok(f.logs.some(row => row.gateDecision === 'duplicate-compaction-ignored' && row.compactionEpoch === 10));
+  assert.ok(f.logs.some(row => row.gateDecision === 'context-cleared' && row.compactionEpoch === 11 && !row.recoveryPending));
+});
+
+test('compaction queued during startup is handled once after initialization finishes', async () => {
+  const f = await fixture();
+  let release;
+  f.session.rpc.metadata.snapshot = () => new Promise(resolve => { release = resolve; });
+  const bridge = new CaptureBridge({
+    session: f.session, store: f.store, config: async () => defaults,
+    log: async row => f.logs.push(row), clock: () => start,
+  });
+  const starting = bridge.start();
+  const event = { type: 'session.compaction_complete', id: 'during-startup', data: { success: true } };
+  const completing = bridge.on(event);
+  await new Promise(resolve => setImmediate(resolve));
+  release({ workingDirectory: run, isRemote: false, clientName: 'github/cli' });
+  await Promise.all([starting, completing]);
+  await bridge.on(event);
+  assert.equal((await f.state()).compactionEpoch, 1);
+  assert.equal((await f.state()).pendingRecoveryEpoch, 1);
+  assert.equal(f.sent.length, 0);
+});
+
+test('compaction transition is logged only after its state has been persisted', async () => {
+  const f = await fixture();
+  const transaction = f.store.transaction.bind(f.store);
+  f.store.transaction = async () => { throw Object.assign(new Error('synthetic state failure'), { code: 'EIO' }); };
+  f.logs.length = 0;
+  await f.event('session.compaction_complete', { success: true }, { id: 'not-persisted' });
+  assert.ok(!f.logs.some(row => row.gateDecision === 'epoch-reset'));
+  f.store.transaction = transaction;
+  assert.equal((await f.state()).compactionEpoch, 0);
+  await f.event('session.compaction_complete', { success: true }, { id: 'not-persisted' });
+  assert.equal((await f.state()).compactionEpoch, 1);
+  assert.ok(f.logs.some(row => row.gateDecision === 'epoch-reset'));
+});
+
+test('persisted transition logs whitelist state fields and preserve distinct compactions within a minute', async () => {
+  const directory = await mkdtemp(join(run, 'transition-logs-'));
+  const logger = createLogger(directory, 'test-session', () => start);
+  const record = {
+    event: 'session.compaction_complete', gateDecision: 'epoch-reset', compactionEpoch: 1,
+    recoveryPending: true, trackingMode: 'events-only', prompt: 'private-synthetic-prompt',
+  };
+  await logger(record);
+  await logger(record);
+  await logger({ ...record, compactionEpoch: 2 });
+  await logger({ event: 'startup', gateDecision: 'attached', trackingMode: 'private-mode',
+    compactionEpoch: 'private-epoch', recoveryPending: 'private-flag' });
+  const text = await readFile(join(directory, 'test-session.jsonl'), 'utf8');
+  const rows = text.trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(rows.length, 3);
+  assert.equal(rows[0].compactionEpoch, 1);
+  assert.equal(rows[1].compactionEpoch, 2);
+  assert.equal(rows[0].recoveryPending, true);
+  assert.equal(rows[0].trackingMode, 'events-only');
+  assert.ok(!text.includes('private'));
+});
 
 test('one attributed queued notice accompanies activity transitions without routine lifecycle chatter', async () => {
   const f = await fixture();
@@ -601,7 +716,6 @@ test('duplicate compaction completion and reload do not duplicate a recovery req
   const f = await fixture();
   const id = 'successful-compaction';
   await f.event('session.compaction_complete', { success: true }, { id });
-  f.compactions(1);
   await f.reload();
   assert.equal((await f.state()).pendingRecoveryEpoch, 1);
   f.info({ totalTokens: 10000, limit: 100000 });
@@ -746,7 +860,6 @@ test('already-idle check still yields to background tasks and queued foreground 
 test('resuming an unsent pending recovery while already idle does not need a new user prompt', async () => {
   const f = await fixture();
   await f.event('session.compaction_complete', { success: true });
-  f.compactions(1);
   f.processing(false);
   await f.reload();
   assert.equal(f.sent.length, 1);
@@ -860,38 +973,38 @@ test('failed initialization does not prompt until it can establish the native ba
   assert.equal(f.sent.length, 1);
 });
 
-test('attribution failure records its operation and safe RPC code, then retries initialization without duplicate capture', async () => {
+test('snapshot failure records its operation and safe RPC code, then retries initialization without duplicate capture', async () => {
   const f = await fixture();
-  const attribution = f.session.rpc.metadata.getContextAttribution;
+  const snapshot = f.session.rpc.metadata.snapshot;
   f.logs.length = 0;
-  f.session.rpc.metadata.getContextAttribution = async () => {
+  f.session.rpc.metadata.snapshot = async () => {
     throw Object.assign(new Error('private-native-error'), { code: -32601, data: 'private-response' });
   };
   await f.reload();
   const failed = f.logs.find(row => row.gateDecision === 'event-error');
   assert.equal(failed.phase, 'initialization');
-  assert.equal(failed.operation, 'metadata.context-attribution');
+  assert.equal(failed.operation, 'metadata.snapshot');
   assert.equal(failed.code, -32601);
   assert.equal(failed.errorType, 'Error');
-  assert.match(f.warnings.at(-1).message, /metadata.context-attribution: -32601/);
+  assert.match(f.warnings.at(-1).message, /metadata.snapshot: -32601/);
   assert.ok(!f.logs.some(row => row.gateDecision === 'attached'));
   f.info({ totalTokens: 51000, limit: 200000 });
   await f.idle();
   assert.equal(f.sent.length, 0);
   assert.ok(!JSON.stringify([f.logs, f.warnings]).includes('private'));
-  f.session.rpc.metadata.getContextAttribution = attribution;
+  f.session.rpc.metadata.snapshot = snapshot;
   await f.idle();
   await f.idle();
   assert.equal(f.sent.length, 1);
   assert.ok(f.logs.some(row => row.gateDecision === 'attached'));
 });
 
-test('invalid attribution response retains the failing operation without exposing exception text', async () => {
+test('invalid snapshot response retains the failing operation without exposing exception text', async () => {
   const f = await fixture();
-  f.session.rpc.metadata.getContextAttribution = async () => null;
+  f.session.rpc.metadata.snapshot = async () => { throw new TypeError('private-invalid-snapshot'); };
   await f.reload();
   const failed = f.logs.findLast(row => row.gateDecision === 'event-error');
-  assert.equal(failed.operation, 'metadata.context-attribution');
+  assert.equal(failed.operation, 'metadata.snapshot');
   assert.equal(failed.errorType, 'TypeError');
   assert.equal(failed.code, 'UNKNOWN');
   assert.ok(!JSON.stringify(f.logs).includes('Cannot read'));
@@ -956,20 +1069,20 @@ test('another consumed logical turn clears old progress, while immediate steerin
   assert.equal((await f.state()).captureInFlight, null);
 });
 
-test('reload observes compaction missed while detached and resets epoch', async () => {
+test('reload rebases lower tokens without inventing a missed compaction or recovery', async () => {
   const f = await fixture();
   f.info({ totalTokens: 65000, limit: 100000 });
   await f.idle();
   await f.event('user.message', { messageId: 'message-1' });
   await f.idle();
-  f.compactions(1);
   f.info({ totalTokens: 10000, limit: 100000 });
   await f.reload();
-  assert.equal((await f.state()).compactionEpoch, 1);
+  assert.equal((await f.state()).compactionEpoch, 0);
   assert.equal((await f.state()).baselineTokens, 10000);
   await f.idle();
-  assert.equal(f.sent.length, 2);
-  assert.match(f.sent.at(-1).displayPrompt, /^Basic Memory recovery:/);
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).pendingRecoveryEpoch, null);
+  assert.equal((await f.state()).pressureOpportunityEpoch, 0);
   assert.equal((await f.state()).lastOpportunityAt, start);
 });
 
@@ -1055,7 +1168,7 @@ test('persisted failures retain safe details and do not throttle different opera
   const logger = createLogger(directory, 'test-session', () => start);
   const record = {
     event: 'bridge', gateDecision: 'event-error', phase: 'initialization',
-    operation: 'metadata.context-attribution', code: -32601, errorType: 'Error',
+    operation: 'metadata.snapshot', code: -32601, errorType: 'Error',
     message: 'private-message', stack: 'private-stack', path: 'private-path',
   };
   await logger(record);
@@ -1069,7 +1182,7 @@ test('persisted failures retain safe details and do not throttle different opera
   assert.deepEqual(rows[0], {
     timestamp: new Date(start).toISOString(), sessionId: 'test-session',
     event: 'bridge', gateDecision: 'event-error', phase: 'initialization',
-    operation: 'metadata.context-attribution', code: -32601, errorType: 'Error',
+    operation: 'metadata.snapshot', code: -32601, errorType: 'Error',
   });
   assert.equal(rows[1].operation, 'state.lock-acquire');
   assert.equal(rows[2].code, 'RPC_TIMEOUT');
@@ -1088,11 +1201,11 @@ test('a failed diagnostic writer falls back to safe stderr without breaking late
     log: async () => { throw Object.assign(new Error('private-log-path'), { code: 'EACCES' }); },
     clock: () => start,
   });
-  f.session.rpc.metadata.getContextAttribution = async () => {
+  f.session.rpc.metadata.snapshot = async () => {
     throw Object.assign(new Error('private-rpc-data'), { code: -32601 });
   };
   await bridge.start();
-  assert.equal(stderr.at(-1).operation, 'metadata.context-attribution');
+  assert.equal(stderr.at(-1).operation, 'metadata.snapshot');
   assert.equal(stderr.at(-1).code, -32601);
   assert.deepEqual(stderr.at(-1).diagnosticFailure, {
     operation: 'diagnostic.write', code: 'EACCES', errorType: 'Error',
