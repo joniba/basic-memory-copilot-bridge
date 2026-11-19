@@ -406,9 +406,10 @@ export class CaptureBridge {
   async initialize() {
     const config = await this.readConfig();
     const metadata = await bounded(this.session.rpc.metadata.snapshot());
-    if (metadata.isRemote || (metadata.clientName && metadata.clientName !== 'copilot-cli')) {
+    // clientName is a telemetry label, not a local/remote boundary.
+    if (metadata?.isRemote !== false) {
       this.stopped = true;
-      await this.report('startup', 'unsupported-session');
+      await this.report('startup', metadata?.isRemote === true ? 'unsupported-remote-session' : 'session-locality-unverified');
       return;
     }
     this.context.cwd = metadata.workingDirectory;

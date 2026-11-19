@@ -9,6 +9,7 @@
   },
   "files": [
     "extension/extension.mjs",
+    "extension/sdk-compat.mjs",
     "extension/bridge.mjs",
     "extension/commands.mjs",
     "extension/status-publisher.mjs",

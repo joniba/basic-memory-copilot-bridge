@@ -17,7 +17,7 @@ await mkdir(artifacts, { recursive: true });
 const run = await mkdtemp(join(artifacts, 'extension-unit-'));
 const start = Date.parse('2026-10-08T10:00:00Z');
 
-async function fixture(overrides = {}, id = 'test-session') {
+async function fixture(overrides = {}, id = 'test-session', metadata = { isRemote: false, clientName: 'copilot-cli' }) {
   const directory = await mkdtemp(join(run, 'case-'));
   const store = new FileStateStore(join(directory, 'sessions'), id);
   const sent = [];
@@ -37,7 +37,7 @@ async function fixture(overrides = {}, id = 'test-session') {
     send: async message => { sent.push(message); return `message-${sent.length}`; },
     rpc: {
       metadata: {
-        snapshot: async () => ({ workingDirectory: directory, isRemote: false, clientName: 'copilot-cli' }),
+        snapshot: async () => ({ workingDirectory: directory, ...metadata }),
         contextInfo: async () => ({ contextInfo: info }),
         getContextAttribution: async () => ({ contextAttribution: { compactions: { count: compactions } } }),
         activity: async () => ({ hasActiveWork: active }),
@@ -69,6 +69,28 @@ async function fixture(overrides = {}, id = 'test-session') {
   };
   return f;
 }
+
+test('a local session with a different client label publishes the checkpoint forecast', async () => {
+  const f = await fixture({}, 'test-session', { isRemote: false, clientName: 'alternate-cli-host' });
+  assert.equal(f.statuses.at(-1)?.kind, 'hint');
+  assert.equal(f.statuses.at(-1).labels.tokens, 'last checkpoint: none, next checkpoint: {tokens}');
+  assert.equal((await f.state()).baselineTokens, 1000);
+  assert.equal(f.sent.length, 0);
+});
+
+test('remote or unverified-locality sessions do not start checkpoint tracking', async () => {
+  for (const [metadata, reason] of [
+    [{ isRemote: true, clientName: 'copilot-cli' }, 'unsupported-remote-session'],
+    [{ clientName: 'copilot-cli' }, 'session-locality-unverified'],
+  ]) {
+    const f = await fixture({}, 'test-session', metadata);
+    await f.idle();
+    assert.deepEqual(f.logs.map(row => row.gateDecision), [reason]);
+    assert.equal(f.statuses.length, 0);
+    assert.equal(f.sent.length, 0);
+    await assert.rejects(f.state(), { code: 'ENOENT' });
+  }
+});
 
 test('one attributed queued notice accompanies activity transitions without routine lifecycle chatter', async () => {
   const f = await fixture();

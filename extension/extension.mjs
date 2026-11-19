@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { joinSession } from '@github/copilot-sdk/extension';
+import { joinSession } from './sdk-compat.mjs';
 import { CaptureBridge, createLogger, FileStateStore, validateConfig } from './bridge.mjs';
 import { StatusPublisher } from './status-publisher.mjs';
 import { bridgeCommand } from './commands.mjs';
