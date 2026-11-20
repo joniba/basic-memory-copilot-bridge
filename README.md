@@ -136,6 +136,52 @@ there is no byte fallback. Compaction resets context baselines, and a missed
 pre-compaction opportunity does not schedule a recovery capture afterward.
 Capture before every compaction is not guaranteed.
 
+### Pressure escalation
+
+This branch adds an event-driven 70%/75% policy without a new token-growth gate:
+
+| Condition | Request |
+| --- | --- |
+| Normal 65% checkpoint turn finished normally, even if capture was skipped | One additional 75% checkpoint at safe idle, retaining the existing five-minute pressure gap |
+| Normal checkpoint has not finished and no checkpoint is already running | At 70%, send one immediate steering request rather than wait for session idle |
+| The 70% request reached the agent | No additional pressure request or aggressive interruption at 75% |
+| The 70% request is still undelivered at 75%, or the first observation is already >=75% | One emergency interruption and checkpoint prompt, unless a checkpoint is already running or unrelated work is queued |
+
+The 70% decision uses the native delivery event, not queue acceptance or proof of
+a saved note. The 65% decision uses normal native checkpoint-turn finish.
+Capture-then-continue can keep that run in flight until its later native finish;
+neither delivery nor the continuation sentence falsely completes the 65% step.
+Compaction and context clearing reset per-cycle stage bookkeeping; a token
+decrease alone does not. Existing capture thresholds, history and recovery remain.
+
+The bridge does not inspect note contents, assess capture quality, reason about
+the task or manage its resumption. It adds no polling, completion acknowledgement
+or whole-task deadline. Existing bounded RPC waits remain.
+
+Plain native cancellation clears pending messages. Before aggressive interruption,
+the bridge takes one snapshot using its existing queue API and skips if unrelated
+queued messages or steering are present. The visible warning is:
+
+```text
+[basic-memory-bridge] Emergency checkpoint skipped to preserve queued messages. Pause pending work, then ask this session to run memory-capture.
+```
+
+There is no queue backup/restore or automatic queue watcher/retry. A new message
+arriving after the snapshot but before cancellation can still be discarded.
+Immediate steering is read at a subsequent model step, not an instantaneous
+tool stop. Cancellation is not an exact pause/resume guarantee and can race
+compaction or tool completion.
+
+### Automated checkpoint prompts
+
+Prompts identify the request with a bracketed header:
+`[basic-memory-bridge: standard-interval-checkpoint]`,
+`[basic-memory-bridge: pressure-checkpoint]`, or
+`[basic-memory-bridge: emergency-checkpoint]`.
+Their final sentence asks the agent to resume its previous unfinished task after
+capturing or deciding not to, respecting newer instructions and explicit
+stop/cancel requests. The bridge itself does not restart the task.
+
 ### Recovering state after compaction
 
 After a successful root-session compaction, the bridge offers a separate

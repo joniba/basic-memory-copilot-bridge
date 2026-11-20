@@ -15,7 +15,9 @@ const help = [
   'Session overrides, reset and --global are not supported in this version.',
   'Only periodic token growth changes. Time cooldowns, pressure rules and checkpoint history stay unchanged.',
   'Post-compaction recovery reads existing captures; configure recoverAfterCompaction to enable or disable it.',
-  'Checkpoints still wait for safe idle. Other sessions adopt updates on their next native event.',
+  'Pressure escalation: a normally finished 65% checkpoint permits one extra idle-only 75% checkpoint after the pressure gap.',
+  'Otherwise 70% steers once; delivery suppresses 75%. If undelivered at 75%, emergency interruption skips unrelated queued work and warns.',
+  'Periodic and normal pressure checkpoints wait for safe idle; escalation follows the delivery rules above. Other sessions adopt updates on their next native event.',
   'Type /bm-bridge and press Enter for the menu. Inline argument suggestions are not available.',
 ].join('\n');
 const codes = new Set(['EACCES', 'EPERM', 'EBUSY', 'EEXIST', 'ENOENT', 'ENOSPC', 'EIO', 'ENOTDIR', 'EISDIR']);
@@ -185,8 +187,9 @@ export function bridgeCommand(path, getBridge) {
         }
         await notify([
           `Machine-wide periodic interval: ${config.periodicMinimumNewTokens / 1000}K tokens; minimum time: ${config.minimumMinutesBetweenOpportunities}m.`,
-          `Automatic checkpoints: ${config.enabled ? 'enabled' : 'disabled'}. Pressure: ${config.contextPressureThreshold * 100}%; minimum time: ${config.pressureMinimumMinutesBetweenOpportunities}m; once per compaction epoch.`,
+          `Automatic checkpoints: ${config.enabled ? 'enabled' : 'disabled'}. Normal pressure: ${config.contextPressureThreshold * 100}%; minimum time: ${config.pressureMinimumMinutesBetweenOpportunities}m; once per compaction epoch.`,
           `Post-compaction state recovery: ${config.recoverAfterCompaction ? 'enabled' : 'disabled'} (read existing captures at safe idle).`,
+          'Escalation: 70% steering if the normal checkpoint has not finished; delivery suppresses 75% interruption. Emergency at 75% preserves unrelated queued work by skipping and warning.',
           '', help,
         ].join('\n'));
         return;

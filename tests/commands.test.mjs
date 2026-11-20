@@ -316,7 +316,8 @@ test('menu settings and help expose current details while preserving inline oper
     f.select(selected);
     await f.invoke('');
     assert.match(f.logs.at(-1).message, /Supported operations:/);
-    assert.match(f.logs.at(-1).message, /Pressure: 65%; minimum time: 5m/);
+    assert.match(f.logs.at(-1).message, /Normal pressure: 65%; minimum time: 5m/);
+    assert.match(f.logs.at(-1).message, /70% steering.*75% interruption/);
     assert.match(f.logs.at(-1).message, /minimum time: 60m/);
     assert.deepEqual(await files.readFile(f.path), before);
   }
