@@ -56,6 +56,9 @@ flowchart TD
 - Preserve an interruption received during startup. Only user/default-origin
   input clears the pause; automatic source tags, autopilot-continuation flags
   and the known agent-relay wrapper do not.
+- Recheck observed interruption after recovery processing/admission reads and
+  before sending. A pending read-only recovery must not create another automated
+  turn after a stop was already observed.
 
 The bridge uses existing lifecycle/delivery events, not guesses about what the
 agent has done. No new confirmation API or analysis of the user task is introduced.

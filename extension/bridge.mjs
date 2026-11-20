@@ -617,6 +617,11 @@ export class CaptureBridge {
     if (!config.enabled || !config.recoverAfterCompaction) return;
     const { processing } = await diagnosed('metadata.is-processing', () => bounded(this.session.rpc.metadata.isProcessing()));
     if (typeof processing !== 'boolean') throw new Error('processing-state-invalid');
+    if (this.stopped || this.compactionStarting || this.pressurePaused) {
+      await this.report('bridge.recovery_check', this.compactionStarting
+        ? 'recovery-deferred-compaction' : 'recovery-stopped', config);
+      return;
+    }
     if (processing) {
       await this.report('bridge.recovery_check', 'recovery-awaiting-idle', config);
       return;
@@ -871,6 +876,10 @@ export class CaptureBridge {
         await this.report(event.type, 'usage-unavailable', config);
         return;
       }
+      if (state.pendingRecoveryEpoch !== null && (this.stopped || this.pressurePaused)) {
+        await this.report(event.type, 'recovery-stopped', config);
+        return;
+      }
       const decision = config.enabled && state.pendingRecoveryEpoch !== null && !state.compacting
         && (state.retryAfter === null || this.clock() >= state.retryAfter)
         ? 'recovery' : pressureEscalation(state, config) ?? eligibility(state, config, this.clock());
@@ -881,7 +890,15 @@ export class CaptureBridge {
         return;
       }
       const activity = await diagnosed('metadata.activity', () => bounded(this.session.rpc.metadata.activity()));
+      if (decision === 'recovery' && (this.stopped || this.pressurePaused)) {
+        await this.report(event.type, 'recovery-stopped', config);
+        return;
+      }
       const pending = await diagnosed('queue.pending-items', () => bounded(this.session.rpc.queue.pendingItems()));
+      if (decision === 'recovery' && (this.stopped || this.pressurePaused)) {
+        await this.report(event.type, 'recovery-stopped', config);
+        return;
+      }
       if (activity.hasActiveWork || pending.items.length || pending.steeringMessages.length) {
         await this.report(event.type, 'busy', config);
         return;
@@ -919,6 +936,9 @@ export class CaptureBridge {
     let accepted = false;
     let sending = false;
     try {
+      if (offer.kind === 'recovery' && (this.stopped || this.pressurePaused)) {
+        return restore('recovery-stopped');
+      }
       if (['pressure-steering', 'emergency'].includes(offer.kind)
         && (this.stopped || this.compactionStarting || this.pressurePaused)) {
         return restore('pressure-escalation-suppressed');
@@ -951,8 +971,8 @@ export class CaptureBridge {
         await this.report(event.type, offer.kind === 'recovery' ? 'recovery-deferred-compaction' : 'missed-pre-compaction', config);
         return;
       }
-      if (this.stopped || this.pressurePaused && ['pressure-steering', 'emergency'].includes(offer.kind)) {
-        return restore('pressure-stopped');
+      if (this.stopped || this.pressurePaused && ['pressure-steering', 'emergency', 'recovery'].includes(offer.kind)) {
+        return restore(offer.kind === 'recovery' ? 'recovery-stopped' : 'pressure-stopped');
       }
       if (offer.kind === 'emergency' && event.type !== 'session.idle') {
         if (received()) return restore('pressure-delivered-before-escalation');

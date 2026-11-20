@@ -1297,6 +1297,99 @@ test('aborted idle cancels the unsent recovery instead of reviving work after ca
   assert.equal((await f.state()).pendingRecoveryEpoch, null);
 });
 
+test('review recovery regression: interruption during the processing read stops startup and completion recovery', async t => {
+  for (const trigger of ['reload', 'compaction']) {
+    await t.test(trigger, async () => {
+      const f = await fixture();
+      if (trigger === 'reload') await f.store.transaction(state => {
+        state.compactionEpoch = 1;
+        state.pendingRecoveryEpoch = 1;
+      });
+      f.processing(false);
+      let release;
+      let entered;
+      const reading = new Promise(resolve => { entered = resolve; });
+      f.session.rpc.metadata.isProcessing = () => new Promise(resolve => {
+        release = resolve;
+        entered();
+      });
+      const recovery = trigger === 'reload' ? f.reload() : f.event('session.compaction_complete', { success: true });
+      await reading;
+      const interrupted = f.idle(true);
+      release({ processing: false });
+      await Promise.all([recovery, interrupted]);
+      assert.equal(f.sent.length, 0);
+      assert.equal(f.aborts.length, 0);
+      assert.equal((await f.state()).captureInFlight, null);
+      assert.equal((await f.state()).pendingRecoveryEpoch, null);
+      assert.equal((await f.state()).pressureEscalationPaused, true);
+    });
+  }
+});
+
+test('review recovery regression: interruption during recovery admission cannot create an automated turn', async t => {
+  for (const [group, method] of [['metadata', 'contextInfo'], ['metadata', 'activity'], ['queue', 'pendingItems']]) {
+    await t.test(`${group}.${method}`, async () => {
+      const f = await fixture();
+      f.processing(false);
+      let release;
+      let entered;
+      const reading = new Promise(resolve => { entered = resolve; });
+      const original = f.session.rpc[group][method];
+      f.session.rpc[group][method] = () => {
+        f.session.rpc[group][method] = original;
+        return new Promise(resolve => {
+          release = async () => resolve(await original());
+          entered();
+        });
+      };
+      const recovery = f.event('session.compaction_complete', { success: true });
+      await reading;
+      const interrupted = f.idle(true);
+      await release();
+      await Promise.all([recovery, interrupted]);
+      assert.equal(f.sent.length, 0);
+      assert.equal(f.aborts.length, 0);
+      assert.equal((await f.state()).captureInFlight, null);
+      assert.equal((await f.state()).pendingRecoveryEpoch, null);
+      assert.equal((await f.state()).pressureEscalationPaused, true);
+    });
+  }
+});
+
+test('review recovery regression: interruption after reservation still prevents the recovery send', async () => {
+  const f = await fixture();
+  await f.store.transaction(state => {
+    state.compactionEpoch = 1;
+    state.pendingRecoveryEpoch = 1;
+  });
+  f.processing(false);
+  let release;
+  let entered;
+  let held = false;
+  const publishing = new Promise(resolve => { entered = resolve; });
+  const bridge = new CaptureBridge({
+    session: f.session, store: f.store, config: async () => defaults,
+    log: async row => f.logs.push(row), clock: () => start,
+    status: async () => {
+      if (!held && bridge.lastState?.captureInFlight?.kind === 'recovery') {
+        held = true;
+        await new Promise(resolve => { release = resolve; entered(); });
+      }
+    },
+  });
+  const recovery = bridge.start();
+  await publishing;
+  const interrupted = bridge.on({ type: 'session.idle', data: { aborted: true } });
+  release();
+  await Promise.all([recovery, interrupted]);
+  assert.equal(f.sent.length, 0);
+  assert.equal(f.aborts.length, 0);
+  assert.equal((await f.state()).captureInFlight, null);
+  assert.equal((await f.state()).pendingRecoveryEpoch, null);
+  assert.equal((await f.state()).pressureEscalationPaused, true);
+});
+
 test('failed recovery send is reported once per compaction without consuming capture clocks', async () => {
   const f = await fixture();
   await f.event('session.compaction_complete', { success: true });

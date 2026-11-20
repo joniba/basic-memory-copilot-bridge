@@ -1,7 +1,7 @@
 # Implementation plan
 
 Status: independent design review passed. The first implementation review found
-lifecycle blockers; focused corrections are implemented and all 277 regression
+lifecycle blockers; focused corrections are implemented and all 285 regression
 tests pass. Repeated isolated native acceptance also passes. Obtain renewed
 implementation and exact-object privacy reviews before publication.
 
@@ -42,6 +42,9 @@ implementation and exact-object privacy reviews before publication.
   uncertain receipts across reload and context reset, an unsent steering
   reservation racing normal checkpoint delivery, and cross-cycle records through
   the actual capped logger.
+- Cover interrupted recovery while processing/admission reads are held and
+  after reservation, so a queued cancellation handler cannot be overtaken by
+  another automated turn.
 
 ## 4. Publish for review
 
