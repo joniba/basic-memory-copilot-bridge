@@ -6,6 +6,9 @@ Memory `memory-capture` skill performs any actual writing. The extension
 uses native context information, not transcript bytes, and adds no shell
 hooks, plugin manifest, custom MCP server, bundled skill, or model client.
 
+For the cumulative stabilization fixes on this branch, see the
+[release notes](RELEASE-NOTES.md).
+
 ## Requirements
 
 - Node.js 20 or newer (tested with 24.16.0), Git, and GitHub Copilot CLI.
@@ -144,15 +147,24 @@ questions and the next step. It does not request a new capture, note edits or
 corpus synchronization. Missing local memory or a missing capture is a reason
 to skip; a previous checkpoint does not prove a note was saved.
 
+Manual compaction can finish while the session is already idle without emitting
+another idle event. After successful compaction (and when resuming an unsent
+reminder), the bridge therefore checks the native processing state explicitly.
+If no message/continuation is processing, it rechecks activity and pending queues
+before admitting recovery. A busy session still waits for its normal root idle;
+an individual assistant turn ending is not treated as sufficient.
+
 `recoverAfterCompaction` defaults to `true`, including for existing config files
 that omit it. Set it to `false` in the installed config to disable new recovery
 requests; `enabled: false` disables all new bridge requests. The command's
 **Current settings** view also reports this setting. Failed/subagent compactions,
 rewinds, lower context counts and explicit context clearing do not trigger it.
 
-Pending recovery survives a reload, and a native count increase can reconcile
-a compaction missed while detached. Initial attachment does not replay historical
-compactions. Multiple pending compactions coalesce into recovery for the latest
+Pending recovery survives a reload. Tracking uses successful live compaction
+events and saved per-session state, not context-attribution queries, polling or
+historical scans. Compactions while the extension is unloaded/disconnected cannot
+be observed or reconstructed and do not automatically request recovery.
+Multiple pending compactions coalesce into recovery for the latest
 epoch. There is at most one send attempt per epoch: failed or ambiguous sends
 are reported, not blindly retried. An aborted idle clears an unsent reminder.
 Once accepted, a recovery follows the normal queue/permission rules; it is not
@@ -311,8 +323,8 @@ failure behavior. This optional component does not change automatic capture.
 The updater leaves checkpoint state files byte-identical and never reloads a
 running session automatically. The native bridge separately reconciles context
 when it is attached/reloaded. Its existing policy rebases periodic watermarks
-when a native token total decreases, even if the successful compaction count is
-unchanged. That can discard accrued periodic growth and move the displayed
+when a native token total decreases without an observed compaction.
+That can discard accrued periodic growth and move the displayed
 target; retaining state files is not a guarantee of an identical forecast after
 reload. This packaging change does not alter that runtime policy or the capture
 thresholds. Opportunity timestamps and actual epoch/reset rules remain intact.

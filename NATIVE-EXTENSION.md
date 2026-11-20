@@ -132,13 +132,41 @@ protect each state file; a leftover lock fails open and requires owner-checked
 manual recovery rather than automatic age-based removal. The updater itself
 does not write these state files. Runtime token reconciliation can still rebase
 watermarks after a lower native reading, including on reload with the same
-compaction count; see the installation guide's preservation caveat.
+observed compaction; see the installation guide's preservation caveat.
+
+Compaction tracking is event-only. A successful root compaction advances the
+saved context-cycle marker once per handled event identity and may arm read-only
+recovery. Failed compactions do not advance it. Explicit context clearing resets
+the cycle separately and never requests recovery. Reload retains those markers,
+pending requests and capture cooldowns; it does not reconstruct events missed
+while unloaded. The legacy `nativeCompactionCount` field remains untouched for
+state-file compatibility but is neither queried nor used for decisions.
+No context-attribution request, replacement API, polling or history scan is used.
+The session's telemetry client name is not an eligibility check.
 
 Diagnostics contain only timestamp, session ID, event, ratio, and fixed
-decision codes. Repeated identical decisions are limited to once per minute;
-each session log stops growing at 1 MiB. No prompts, transcript contents,
-tool results, paths, or exception text are logged. Errors produce a bounded
-timeline warning. Set `enabled: false` to stop new automatic opportunities.
+decision codes. Failures also identify the initialization/event phase,
+operation (for example `metadata.snapshot` or `state.lock-acquire`),
+allowlisted filesystem/RPC error code, and error type. Unknown values become
+`unknown`/`UNKNOWN`; raw exception messages and stacks are never recorded.
+The timeline warning includes the same safe operation/code/type, so a failed
+initialization is distinguishable from a running process that successfully
+recorded `startup` / `attached`. Initialization retries at the next root idle.
+If the session log cannot be written, sanitized diagnostics fall back to the
+extension process log, retaining both the original failure and the logging failure.
+Repeated identical decisions/failures are limited to once per minute; distinct
+operations or error codes are not suppressed together. Each session log stops
+growing at 1 MiB. No prompts, transcript contents, tool results, paths, or
+exception text are logged. Set `enabled: false` to stop new automatic opportunities.
+
+Successful startup records `attached` with `trackingMode: events-only`.
+After the state write succeeds, compaction completion records `epoch-reset`,
+failure records `compaction-error`, and context clearing records `context-cleared`.
+Repeated event identities record `duplicate-compaction-ignored` or
+`duplicate-clear-ignored` without advancing the cycle. These records include only
+the numeric `compactionEpoch` and boolean `recoveryPending`, not conversation
+contents or evidence that a memory read/write succeeded. Distinct cycle changes
+remain visible within the same minute; identical repeated records are throttled.
 
 ## Status-line contribution
 
@@ -150,7 +178,13 @@ without prompts, tool contents, paths, or error text. Atomic publication and a
 30-second lease, renewed every ten seconds, prevent stale activity after a
 process exits; a superseded process cannot clear the newer owner's signal.
 Short status-file sharing/lock conflicts are retried within a bounded window,
-without removing another writer's lock. Sanitized operation/error-code diagnostics
+without removing another writer's lock. Windows status publication uses a
+short-lived, exclusive named pipe as its lock. Windows releases it when the
+writer exits, preventing an abandoned marker from blocking future sessions.
+Legacy status lock files are ignored and left untouched. This changes only
+status-publication locking, not checkpoint-state, configuration or installer
+locks. Other platforms retain the existing file-lock behavior.
+Sanitized operation/error-code diagnostics
 distinguish replacement, lock and cleanup failures. Heartbeats retain the latest
 requested display intent; failed clears let old activity expire instead of
 renewing it indefinitely. See the status-line guide for recovery limits.
@@ -186,6 +220,16 @@ compaction, native-usage or abort checks. Failed compactions, child events,
 rewinds/token shrink and `session.context_cleared` are not recovery triggers.
 An aborted idle discards an unsent reminder rather than restarting cancelled work.
 
+Successful compaction also performs a bounded native `metadata.isProcessing`
+check. This handles manual compaction issued while already idle, where no new
+`session.idle` transition is guaranteed. The same check runs after initialization
+when an unsent reminder was preserved. If processing is false, an internal
+`bridge.recovery_check` refreshes usage and reuses the activity/queue admission
+guards; it may only admit recovery, never a periodic/pressure capture. Processing,
+invalid/unavailable state, active tasks or pending user work prevent admission.
+The usual idle handler remains the fallback; no polling or turn-end shortcut is
+introduced. The idle-check/send race remains subject to the existing SDK limits.
+
 The prompt asks for structured `metadata_filters.thread_id` lookup in the
 explicitly selected **local** project and a targeted read of the latest current
 same-thread capture. No capture is assumed to exist. Unknown project, unavailable
@@ -199,9 +243,9 @@ The state store adds an optional, migrated pending epoch and a `recovery` reques
 kind. Accepted requests reuse message correlation, cancellation and resume
 reconciliation, but do not advance capture history, opportunity clocks or pressure
 guards. Correlated recovery-turn growth is excluded from the periodic token
-watermark without resetting prior progress. New pending epochs coalesce; a new
-native successful-compaction count after a known prior count also arms recovery.
-A fresh attachment with no known count does not recover every old compaction.
+watermark without resetting prior progress. New pending epochs coalesce.
+Only observed successful compaction events arm new recovery; attachment does not
+replay historical compactions or infer them from lower token readings.
 
 The pending epoch is consumed when a durable reservation is made. A failed or
 ambiguous send is warned about but not automatically retried, to avoid duplicate

@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { joinSession } from '@github/copilot-sdk/extension';
-import { CaptureBridge, createLogger, FileStateStore, validateConfig } from './bridge.mjs';
+import { bridgeDiagnostic, CaptureBridge, createLogger, FileStateStore, validateConfig } from './bridge.mjs';
 import { StatusPublisher } from './status-publisher.mjs';
 import { bridgeCommand } from './commands.mjs';
 
@@ -35,8 +35,10 @@ try {
   });
   session.on('session.shutdown', () => publisher.close()
     .catch(() => console.error('{"event":"shutdown","gateDecision":"status-error"}')));
-} catch {
-  console.error('{"event":"startup","gateDecision":"connection-error"}');
+} catch (error) {
+  console.error(JSON.stringify({
+    event: 'startup', gateDecision: 'connection-error', ...bridgeDiagnostic(error),
+  }));
   if (session) {
     await session.log('[basic-memory-bridge] Failed to attach; automatic capture is unavailable.', { level: 'warning' })
       .catch(() => console.error('{"event":"startup","gateDecision":"diagnostic-error"}'));
