@@ -574,6 +574,176 @@ test('a receipt reconciles a replacement steering send whose response failed wit
   assert.equal(f.sent.length, 2);
 });
 
+test('review regression: interruption observed during startup prevents escalation before fresh user input', async t => {
+  for (const recoveryPending of [false, true]) {
+    await t.test(recoveryPending ? 'pending recovery' : 'pressure only', async () => {
+      const f = await fixture();
+      if (recoveryPending) await f.store.transaction(state => {
+        state.compactionEpoch = 1;
+        state.pendingRecoveryEpoch = 1;
+      });
+      f.processing(false);
+      let release;
+      f.session.rpc.metadata.snapshot = () => new Promise(resolve => { release = resolve; });
+      f.session.rpc.metadata.contextInfo = async () => ({ contextInfo: { totalTokens: 75000, limit: 100000 } });
+      const bridge = new CaptureBridge({
+        session: f.session, store: f.store, config: async () => defaults,
+        log: async row => f.logs.push(row), clock: () => start,
+      });
+      const starting = bridge.start();
+      const interrupted = bridge.on({ type: 'session.idle', data: { aborted: true } });
+      await new Promise(resolve => setImmediate(resolve));
+      release({ workingDirectory: run, isRemote: false, clientName: 'github/cli' });
+      await Promise.all([starting, interrupted]);
+      assert.equal(f.sent.length, 0);
+      assert.equal(f.aborts.length, 0);
+      assert.equal((await f.state()).pressureEscalationPaused, true);
+      await bridge.on({ type: 'user.message', data: { source: 'user', content: 'Continue the task.', messageId: 'human' } });
+      await bridge.on({ type: 'session.usage_info', data: { currentTokens: 75000, tokenLimit: 100000 } });
+      assert.equal(f.sent.length, 1);
+      assert.equal(f.aborts.length, 1);
+    });
+  }
+});
+
+test('review regression: automated origins cannot clear an interruption pause', async t => {
+  const origins = ['memory', 'skill', 'inter-agent', 'agent-reviewer', 'automation-schedule', 'system', 'autopilot'];
+  for (const source of origins) {
+    await t.test(source, async () => {
+      const f = await fixture();
+      await f.idle(true);
+      await f.event('user.message', { source, content: 'Automatic input.', messageId: source });
+      await f.usage(75000);
+      assert.equal((await f.state()).pressureEscalationPaused, true);
+      assert.equal(f.sent.length, 0);
+      assert.equal(f.aborts.length, 0);
+      await f.event('user.message', { source: 'user', content: 'Continue.', messageId: 'human' });
+      await f.usage(75000);
+      assert.equal(f.sent.length, 1);
+    });
+  }
+  for (const source of [undefined, 'user']) {
+    await t.test(`autopilot continuation with ${source ?? 'default'} source`, async () => {
+      const f = await fixture();
+      await f.idle(true);
+      await f.event('user.message', { source, isAutopilotContinuation: true, content: 'Continue.', messageId: 'autopilot' });
+      await f.usage(75000);
+      assert.equal((await f.state()).pressureEscalationPaused, true);
+      assert.equal(f.sent.length, 0);
+      assert.equal(f.aborts.length, 0);
+    });
+  }
+  await t.test('default-source relay wrapper', async () => {
+    const f = await fixture();
+    await f.idle(true);
+    await f.event('user.message', { content: '[agent-relay] Message from: reviewer\nReview results.', messageId: 'relay' });
+    await f.usage(75000);
+    assert.equal((await f.state()).pressureEscalationPaused, true);
+    assert.equal(f.sent.length, 0);
+    await f.event('user.message', { content: 'Continue.', messageId: 'human-default-source' });
+    await f.usage(75000);
+    assert.equal(f.sent.length, 1);
+  });
+});
+
+test('review regression: uncertain steering receipt remains correlated after reload', async () => {
+  const f = await fixture();
+  f.session.send = async message => {
+    f.sent.push(message);
+    throw Object.assign(new Error('Synthetic missing response.'), { code: -32603 });
+  };
+  await f.usage(70000);
+  const label = f.sent[0].displayPrompt;
+  await f.reload();
+  await f.event('user.message', { source: 'system', content: label, messageId: 'late-receipt' });
+  await f.usage(75000);
+  assert.equal(f.aborts.length, 0);
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).pressureSteeringDeliveredEpoch, 0);
+});
+
+test('review regression: uncertain receipt during reload suppresses startup emergency before its queued handler', async () => {
+  const f = await fixture();
+  f.session.send = async message => {
+    f.sent.push(message);
+    throw new Error('Synthetic response unavailable.');
+  };
+  await f.usage(70000);
+  const label = f.sent[0].displayPrompt;
+  f.info({ totalTokens: 75000, limit: 100000 });
+  const reloading = f.reload();
+  const receipt = f.event('user.message', { source: 'system', content: label, messageId: 'during-reload' });
+  await Promise.all([reloading, receipt]);
+  assert.equal(f.aborts.length, 0);
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).pressureSteeringDeliveredEpoch, 0);
+});
+
+test('review regression: a late uncertain receipt from before compaction or clear cannot select the new cycle', async t => {
+  for (const type of ['session.compaction_complete', 'session.context_cleared']) {
+    await t.test(type, async () => {
+      const f = await fixture({ recoverAfterCompaction: false });
+      f.session.send = async message => {
+        f.sent.push(message);
+        throw new Error('Synthetic response unavailable.');
+      };
+      await f.usage(70000);
+      const label = f.sent[0].displayPrompt;
+      await f.event(type, { success: true }, { id: 'new-cycle' });
+      await f.event('user.message', { source: 'system', content: label, messageId: 'late-old-receipt' });
+      await f.usage(75000);
+      assert.equal(f.aborts.length, 1);
+      assert.equal(f.sent.length, 2);
+      assert.equal((await f.state()).pressureSteeringDeliveredEpoch, null);
+      assert.equal((await f.state()).uncertainRequest.kind, 'emergency');
+    });
+  }
+});
+
+test('review regression: 65% delivery during unsent 70% preparation preserves the extra idle 75% branch', async () => {
+  const f = await fixture();
+  await f.usage(65000);
+  await f.idle();
+  const label = f.sent[0].displayPrompt;
+  const pending = f.session.rpc.queue.pendingItems;
+  let receipt;
+  f.session.rpc.queue.pendingItems = async () => {
+    f.session.rpc.queue.pendingItems = pending;
+    receipt = f.event('user.message', { source: 'system', content: label, messageId: 'message-1' });
+    return { items: [], steeringMessages: [] };
+  };
+  await f.usage(70000);
+  await receipt;
+  assert.equal(f.sent.length, 1, 'No 70% steering was actually sent.');
+  await f.usage(75000);
+  f.time(start + 300000);
+  await f.idle();
+  assert.equal(f.sent.length, 2);
+  assert.equal((await f.state()).captureInFlight.kind, 'pressure-extra');
+  assert.equal(f.aborts.length, 0);
+});
+
+test('review regression: actual capped logger retains critical pressure records from separate cycles', async () => {
+  const f = await fixture({ recoverAfterCompaction: false });
+  const directory = await mkdtemp(join(run, 'pressure-cycle-logs-'));
+  const bridge = new CaptureBridge({
+    session: f.session, store: f.store, config: async () => validateConfig({ recoverAfterCompaction: false }),
+    log: createLogger(directory, f.session.sessionId, () => start), clock: () => start,
+  });
+  await bridge.start();
+  for (let cycle = 0; cycle < 4; cycle += 1) {
+    if (cycle) await bridge.on({ type: 'session.context_cleared', id: `clear-${cycle}`, data: {} });
+    await bridge.on({ type: 'session.usage_info', data: { currentTokens: cycle < 2 ? 70000 : 75000, tokenLimit: 100000 } });
+    await bridge.on({ type: 'user.message', data: { source: 'system', content: f.sent.at(-1).displayPrompt,
+      messageId: `message-${f.sent.length}` } });
+    await bridge.on({ type: 'session.idle', data: {} });
+  }
+  const rows = (await readFile(join(directory, `${f.session.sessionId}.jsonl`), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(rows.filter(row => row.gateDecision === 'pressure-steering-delivered').map(row => row.compactionEpoch), [0, 1]);
+  assert.deepEqual(rows.filter(row => row.gateDecision === 'emergency-abort-requested').map(row => row.compactionEpoch), [2, 3]);
+  assert.deepEqual(rows.filter(row => row.gateDecision === 'emergency-abort-returned').map(row => row.compactionEpoch), [2, 3]);
+});
+
 test('aborted checkpoint clears the active label and shows no recursion or success claim', async () => {
   const f = await fixture();
   f.info({ totalTokens: 51000, limit: 200000 });

@@ -1,8 +1,9 @@
 # Implementation plan
 
-Status: independent design review passed; implementation and 256 regression tests
-completed. Isolated native acceptance passed; implementation/privacy reviews
-remain before publication.
+Status: independent design review passed. The first implementation review found
+lifecycle blockers; focused corrections are implemented and all 277 regression
+tests pass. Repeated isolated native acceptance also passes. Obtain renewed
+implementation and exact-object privacy reviews before publication.
 
 ## 1. Review the policy and boundary
 
@@ -37,6 +38,10 @@ remain before publication.
   working sessions or production corpus writes.
 - Obtain independent implementation review; resolve concrete findings without
   expanding the scope.
+- Cover interruption during held startup, automatic input after cancellation,
+  uncertain receipts across reload and context reset, an unsent steering
+  reservation racing normal checkpoint delivery, and cross-cycle records through
+  the actual capped logger.
 
 ## 4. Publish for review
 

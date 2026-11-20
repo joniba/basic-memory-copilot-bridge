@@ -96,7 +96,7 @@ export function freshState(sessionId) {
     lastOpportunityTokens: null, lastOpportunityAt: null, lastCheckpointTokens: null, lastCheckpointAt: null,
     lastSeenMessagesLength: 0,
     compactionEpoch: 0, nativeCompactionCount: null, lastCompactionEventId: null, pressureOpportunityEpoch: null,
-    pressurePending: false, compacting: false, captureInFlight: null, retryAfter: null,
+    pressurePending: false, compacting: false, captureInFlight: null, uncertainRequest: null, retryAfter: null,
     pendingRecoveryEpoch: null,
     pressureCompletedEpoch: null, pressureExtraOpportunityEpoch: null,
     pressureSteeringAttemptEpoch: null, pressureSteeringDeliveredEpoch: null,
@@ -104,8 +104,17 @@ export function freshState(sessionId) {
   };
 }
 
+function validRequest(flight) {
+  return flight === null || (object(flight) && typeof flight.id === 'string'
+    && ['periodic', 'pressure', 'pressure-extra', 'pressure-steering', 'emergency', 'recovery'].includes(flight.kind)
+    && count(flight.epoch)
+    && typeof flight.errored === 'boolean'
+    && (flight.kind !== 'recovery' || count(flight.startTokens))
+    && typeof flight.started === 'boolean'
+    && (flight.messageId === null || typeof flight.messageId === 'string'));
+}
+
 function validState(state, sessionId) {
-  const flight = state?.captureInFlight;
   return object(state) && state.version === 1 && state.sessionId === sessionId
     && ['baselineTokens', 'lastContextTokens', 'tokenLimit', 'lastOpportunityTokens',
       'lastOpportunityAt', 'lastCheckpointTokens', 'lastCheckpointAt', 'pressureOpportunityEpoch',
@@ -117,13 +126,7 @@ function validState(state, sessionId) {
     && typeof state.pressurePending === 'boolean' && typeof state.compacting === 'boolean'
     && typeof state.pressureEscalationPaused === 'boolean'
     && (state.lastCompactionEventId === null || typeof state.lastCompactionEventId === 'string')
-    && (flight === null || (object(flight) && typeof flight.id === 'string'
-      && ['periodic', 'pressure', 'pressure-extra', 'pressure-steering', 'emergency', 'recovery'].includes(flight.kind)
-      && count(flight.epoch)
-      && typeof flight.errored === 'boolean'
-      && (flight.kind !== 'recovery' || count(flight.startTokens))
-      && typeof flight.started === 'boolean'
-      && (flight.messageId === null || typeof flight.messageId === 'string')));
+    && validRequest(state.captureInFlight) && validRequest(state.uncertainRequest);
 }
 
 export class FileStateStore {
@@ -154,8 +157,9 @@ export class FileStateStore {
             if (!Object.hasOwn(state, key)) state[key] = null;
           }
           if (!Object.hasOwn(state, 'pressureEscalationPaused')) state.pressureEscalationPaused = false;
-          if (object(state.captureInFlight) && !Object.hasOwn(state.captureInFlight, 'errored')) {
-            state.captureInFlight.errored = false;
+          if (!Object.hasOwn(state, 'uncertainRequest')) state.uncertainRequest = null;
+          for (const key of ['captureInFlight', 'uncertainRequest']) {
+            if (object(state[key]) && !Object.hasOwn(state[key], 'errored')) state[key].errored = false;
           }
         }
         if (object(state) && !Object.hasOwn(state, 'lastCheckpointTokens')) {
@@ -168,10 +172,12 @@ export class FileStateStore {
         }
         if (!validState(state, this.sessionId)) throw new Error('state-invalid');
         state = Object.fromEntries(Object.keys(freshState(this.sessionId)).map(key => [key, state[key]]));
-        if (state.captureInFlight) {
-          state.captureInFlight = Object.fromEntries(['id', 'kind', 'epoch', 'messageId', 'started', 'errored',
-            ...(state.captureInFlight.kind === 'recovery' ? ['startTokens'] : [])]
-            .map(key => [key, state.captureInFlight[key]]));
+        for (const key of ['captureInFlight', 'uncertainRequest']) {
+          if (state[key]) {
+            state[key] = Object.fromEntries(['id', 'kind', 'epoch', 'messageId', 'started', 'errored',
+              ...(state[key].kind === 'recovery' ? ['startTokens'] : [])]
+              .map(field => [field, state[key][field]]));
+          }
         }
       } catch (error) {
         if (error.code === 'ENOENT') {
@@ -265,7 +271,7 @@ export function eligibility(state, config, now) {
   const elapsed = state.lastOpportunityAt === null ? Infinity : now - state.lastOpportunityAt;
   if (state.pressureCompletedEpoch === state.compactionEpoch
     && !state.pressureEscalationPaused
-    && state.pressureSteeringAttemptEpoch !== state.compactionEpoch
+    && state.pressureSteeringDeliveredEpoch !== state.compactionEpoch
     && state.pressureExtraOpportunityEpoch !== state.compactionEpoch
     && state.lastContextTokens / state.tokenLimit >= 0.75
     && elapsed >= config.pressureMinimumMinutesBetweenOpportunities * 60000) return 'pressure-extra';
@@ -402,6 +408,12 @@ function ownMessage(flight, data) {
   return flight && typeof data?.messageId === 'string'
     && (flight.messageId === data.messageId
       || (data.source === 'system' && data.content === requestLabel(flight)));
+}
+
+function freshUserMessage(data) {
+  return data.isAutopilotContinuation !== true
+    && (data.source === undefined || data.source === 'user')
+    && !/^\[agent-relay\]/.test(data.content ?? '');
 }
 
 export async function bounded(promise, milliseconds = 5000) {
@@ -557,10 +569,13 @@ export class CaptureBridge {
       if (state.captureInFlight) {
         const pending = await this.pendingFlight(state.captureInFlight);
         const activity = await diagnosed('metadata.activity', () => bounded(this.session.rpc.metadata.activity()));
-        if (!pending && !activity.hasActiveWork) await this.finish(state, 'in-flight-reconciled');
+        if (!pending && !activity.hasActiveWork && !ownMessage(state.captureInFlight, this.lastReceipt)) {
+          if (!state.captureInFlight.started) state.uncertainRequest = { ...state.captureInFlight };
+          await this.finish(state, 'in-flight-reconciled');
+        }
       }
     });
-    this.pressurePaused = this.lastState.pressureEscalationPaused;
+    this.pressurePaused = this.pressurePaused || this.lastState.pressureEscalationPaused;
     this.ready = true;
     await this.report('startup', 'attached', config, {
       trackingMode: 'events-only', compactionEpoch: this.lastState.compactionEpoch,
@@ -575,7 +590,9 @@ export class CaptureBridge {
         this.lastReceipt = {
           source: event.data.source, content: event.data.content, messageId: event.data.messageId,
         };
-      } else if (!['system', 'autopilot'].includes(event.data.source)) this.pressurePaused = false;
+      } else if (freshUserMessage(event.data)
+        && ![this.lastState?.captureInFlight, this.lastState?.uncertainRequest, this.lastRequest]
+          .some(flight => ownMessage(flight, event.data))) this.pressurePaused = false;
     }
     if (event.type === 'session.idle' && event.data.aborted === true) {
       this.pressurePaused = true;
@@ -594,7 +611,7 @@ export class CaptureBridge {
   }
 
   async checkRecoveryIdle() {
-    if (!this.ready || this.stopped || this.compactionStarting
+    if (!this.ready || this.stopped || this.compactionStarting || this.pressurePaused
       || !this.lastState || this.lastState.pendingRecoveryEpoch === null || this.lastState.captureInFlight) return;
     const config = await this.readConfig();
     if (!config.enabled || !config.recoverAfterCompaction) return;
@@ -634,15 +651,17 @@ export class CaptureBridge {
     if (snapshot.compacting) return;
     applyUsage(snapshot, this.usage, config);
     if (!pressureEscalation(snapshot, config)
-      || ownMessage(snapshot.captureInFlight ?? this.lastRequest, this.lastReceipt)) return;
+      || [snapshot.captureInFlight, snapshot.uncertainRequest, this.lastRequest]
+        .some(flight => ownMessage(flight, this.lastReceipt))) return;
     let offer;
     let previous;
     await this.transaction(state => {
       if (state.compacting || this.compactionStarting || this.pressurePaused || this.stopped) return;
       applyUsage(state, this.usage, config);
       const kind = pressureEscalation(state, config);
-      previous = state.captureInFlight ?? this.lastRequest;
-      if (!kind || ownMessage(previous, this.lastReceipt)) return;
+      previous = state.captureInFlight ?? state.uncertainRequest ?? this.lastRequest;
+      if (!kind || [state.captureInFlight, state.uncertainRequest, this.lastRequest]
+        .some(flight => ownMessage(flight, this.lastReceipt))) return;
       offer = {
         id: randomUUID(), kind, epoch: state.compactionEpoch, messageId: null, started: false, errored: false,
       };
@@ -751,10 +770,13 @@ export class CaptureBridge {
     await this.transaction(async (state, recovered) => {
       if (this.usage && !state.compacting) applyUsage(state, this.usage, config);
       if (event.type === 'user.message') {
-        const flight = state.captureInFlight ?? this.lastRequest;
-        const own = ownMessage(flight, event.data);
+        const flight = [state.captureInFlight, state.uncertainRequest, this.lastRequest]
+          .find(request => ownMessage(request, event.data));
+        const own = Boolean(flight);
         if (own) {
-          state.captureInFlight ??= { ...flight };
+          state.captureInFlight = { ...flight };
+          if (state.uncertainRequest?.id === flight.id) state.uncertainRequest = null;
+          this.lastRequest = state.captureInFlight;
           this.acceptOffer(state, flight, event.data.messageId);
           if (flight.kind === 'recovery' && !flight.started && count(state.lastContextTokens)) {
             state.captureInFlight.startTokens = state.lastContextTokens;
@@ -762,12 +784,12 @@ export class CaptureBridge {
           state.captureInFlight.started = true;
           if (flight.kind === 'pressure-steering' && flight.epoch === state.compactionEpoch) {
             state.pressureSteeringDeliveredEpoch = state.compactionEpoch;
-            await this.report(event.type, 'pressure-steering-delivered', config);
+            await this.report(event.type, 'pressure-steering-delivered', config, { compactionEpoch: state.compactionEpoch });
           }
         } else if (state.captureInFlight?.started && ['idle', 'queued'].includes(event.data.delivery)) {
           await this.finish(state, 'checkpoint-turn-finished');
         }
-        if (!own && !['system', 'autopilot'].includes(event.data.source)) {
+        if (!own && freshUserMessage(event.data)) {
           state.pressureEscalationPaused = false;
           this.pressurePaused = false;
         }
@@ -805,6 +827,8 @@ export class CaptureBridge {
             state.lastContextTokens = null;
             state.tokenLimit = null;
             state.pressurePending = false;
+            state.uncertainRequest = null;
+            if (!state.captureInFlight) this.lastRequest = null;
             this.usage = null;
             transition = event.type === 'session.context_cleared' ? 'context-cleared' : 'epoch-reset';
           } else {
@@ -890,7 +914,8 @@ export class CaptureBridge {
       this.lastRequest = previous;
       await this.report(event.type, decision, config);
     };
-    const received = () => ownMessage(previous, this.lastReceipt);
+    const received = () => ownMessage(previous, this.lastReceipt)
+      || ownMessage(this.lastState?.uncertainRequest, this.lastReceipt);
     let accepted = false;
     let sending = false;
     try {
@@ -931,12 +956,12 @@ export class CaptureBridge {
       }
       if (offer.kind === 'emergency' && event.type !== 'session.idle') {
         if (received()) return restore('pressure-delivered-before-escalation');
-        await this.report(event.type, 'emergency-abort-requested', config);
+        await this.report(event.type, 'emergency-abort-requested', config, { compactionEpoch: offer.epoch });
         if (received() || this.compactionStarting || this.stopped || this.pressurePaused) {
           return restore('pressure-escalation-suppressed');
         }
         await diagnosed('session.abort', () => bounded(this.session.abort()));
-        await this.report(event.type, 'emergency-abort-returned', config);
+        await this.report(event.type, 'emergency-abort-returned', config, { compactionEpoch: offer.epoch });
         if (this.compactionStarting || this.stopped || this.pressurePaused) return restore('pressure-stopped');
       }
       sending = true;
@@ -963,6 +988,7 @@ export class CaptureBridge {
       await this.transaction(state => {
         if (state.captureInFlight?.id === offer.id) {
           state.captureInFlight = sending ? null : previous;
+          if (sending) state.uncertainRequest = { ...offer };
           if (['periodic', 'pressure', 'pressure-extra'].includes(offer.kind)) state.retryAfter = this.clock() + 60000;
         }
       });

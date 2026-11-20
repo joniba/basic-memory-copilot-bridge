@@ -53,6 +53,9 @@ flowchart TD
   fresh user work arrives. Do not guess whether that event came from a user
   or the bridge's cancellation call. If it arrives during the emergency
   handoff, honor it rather than overriding it with another prompt.
+- Preserve an interruption received during startup. Only user/default-origin
+  input clears the pause; automatic source tags, autopilot-continuation flags
+  and the known agent-relay wrapper do not.
 
 The bridge uses existing lifecycle/delivery events, not guesses about what the
 agent has done. No new confirmation API or analysis of the user task is introduced.
@@ -86,11 +89,18 @@ Post-compaction read-only recovery remains a separate existing behavior.
 - Persist bounded per-cycle delivery/attempt markers with the existing request
   identity. Missing fields on older state start prospectively; do not reconstruct
   previous deliveries from note contents or old session journals.
+- Retain one uncertain request identity after a failed send response or
+  unconfirmed startup reconciliation. A later matching native receipt can still
+  establish delivery after reload, including before its serialized handler runs.
+  Discard that identity on a matching receipt or successful compaction/context
+  clear; this is not a request history or another acknowledgement protocol.
 - Reuse existing `session.send` with enqueue for normal requests and immediate
   for 70% steering. The only new runtime API is the specifically approved
   `session.abort()` at the 75% emergency step.
 - Recheck locally observed delivery before interruption. An already observed
   70% delivery suppresses cancellation even if it arrived during earlier awaits.
+- An unsent 70% reservation does not suppress the additional idle-only 75%
+  request after the original 65% checkpoint normally finishes.
 - Use existing queue inspection/removal only when managing an owned pending
   checkpoint to avoid duplicate requests; no new queue-control API.
 - Keep existing periodic thresholds and capture history, and prevent resumed
