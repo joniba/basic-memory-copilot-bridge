@@ -1,8 +1,22 @@
 # Release notes
 
+## Startup diagnostic follow-up
+
+On `feature/pressure-escalation`, record startup stages before SDK/local imports,
+around session attachment and on initial bridge readiness. A stalled launch can
+now leave its last reached stage in the extension process log even when the host
+terminates it without returning an exception. Records are a fixed set of safe
+metadata fields on stderr, independent of successful session attachment; no new
+SDK APIs, timers, retry controller or compatibility fallback are introduced.
+
+Entry-module tests cover successful startup, held imports/attachment, sanitized
+import/attachment rejection and failed bridge initialization. The full suite
+passes **294 tests**. This addresses a diagnostic coverage gap; it does not claim
+that a historical startup timeout is fixed merely because a later launch succeeds.
+
 ## Feature candidate: pressure escalation
 
-Branch: `feature/pressure-escalation`. Not installed or merged to main.
+Branch: `feature/pressure-escalation`. Separate from main; activation is per session.
 
 - Add square-bracket automation headers distinguishing standard interval,
   pressure and emergency checkpoint prompts.

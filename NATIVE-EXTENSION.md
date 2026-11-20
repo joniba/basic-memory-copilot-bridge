@@ -190,6 +190,20 @@ operations or error codes are not suppressed together. Each session log stops
 growing at 1 MiB. No prompts, transcript contents, tool results, paths, or
 exception text are logged. Set `enabled: false` to stop new automatic opportunities.
 
+The extension process log also receives a fixed set of startup records before
+loading the SDK and each local module, around `joinSession`, and when initial
+bridge setup finishes. Each record includes a timestamp, elapsed milliseconds
+and a fixed stage; the first record includes the Node version and a validated
+SDK version, never its raw environment path. An import or attachment failure
+retains the last stage plus sanitized error fields. If the host kills a stalled
+launch, the last started stage remains available without requiring an exception
+to be returned. These records use stderr, not the SDK's stdout transport, and
+do not depend on session attachment or the per-session file logger.
+`bridge-ready` means initialization completed; `bridge-not-ready` means the
+bridge handled an initialization failure, not successful attachment.
+These records improve diagnosis; a successful retry alone does not establish
+the cause of an earlier startup timeout.
+
 Successful startup records `attached` with `trackingMode: events-only`.
 After the state write succeeds, compaction completion records `epoch-reset`,
 failure records `compaction-error`, and context clearing records `context-cleared`.
