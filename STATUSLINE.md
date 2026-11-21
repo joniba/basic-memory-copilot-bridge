@@ -202,6 +202,13 @@ it does not identify which external process held an incompatible file handle.
 
 ## Tests
 
+The pressure-escalation candidate keeps the same generic contribution protocol.
+After a normally finished 65% request, the additional 75% idle-only target appears
+in the usual token/time forecast. Accepted steered/emergency requests show
+`queued`, then `delivered` after the matched native receipt rather than implying
+that the agent's resumed work is exclusively capture processing. This is not
+proof of a saved note or completed task. Ordinary request labels are unchanged.
+
 ```powershell
 node --test --test-reporter=spec .\tests\statusline.test.mjs
 ```

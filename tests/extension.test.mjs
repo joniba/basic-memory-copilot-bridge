@@ -9,6 +9,7 @@ import {
   eligibility, FileStateStore, freshState, validateConfig,
   statusContribution,
   recoveryPrompt,
+  pressureEscalation,
 } from '../extension/bridge.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -25,6 +26,7 @@ async function fixture(overrides = {}, id = 'test-session', beforeStart = async 
   const warnings = [];
   const removed = [];
   const statuses = [];
+  const aborts = [];
   let config = validateConfig(overrides);
   let now = start;
   let info = { totalTokens: 1000, limit: 200000 };
@@ -35,6 +37,7 @@ async function fixture(overrides = {}, id = 'test-session', beforeStart = async 
     sessionId: id,
     log: async (message, options) => warnings.push({ message, options }),
     send: async message => { sent.push(message); return `message-${sent.length}`; },
+    abort: async () => { aborts.push(now); },
     rpc: {
       metadata: {
         snapshot: async () => ({ workingDirectory: directory, isRemote: false, clientName: 'copilot-cli' }),
@@ -57,9 +60,13 @@ async function fixture(overrides = {}, id = 'test-session', beforeStart = async 
   await beforeStart({ session, store });
   await bridge.start();
   const f = {
-    directory, store, session, sent, logs, warnings, removed, statuses,
+    directory, store, session, sent, logs, warnings, removed, statuses, aborts,
     state: async () => JSON.parse(await readFile(store.path, 'utf8')),
     info: value => { info = value; },
+    usage: async (tokens, limit = 100000) => {
+      info = { totalTokens: tokens, limit };
+      return bridge.on({ type: 'session.usage_info', data: { currentTokens: tokens, tokenLimit: limit } });
+    },
     time: value => { now = value; },
     config: value => { config = validateConfig(value); },
     active: value => { active = value; },
@@ -192,6 +199,7 @@ test('one attributed queued notice accompanies activity transitions without rout
   const f = await fixture();
   f.info({ totalTokens: 51000, limit: 200000 });
   await f.idle();
+  assert.ok(f.sent[0].prompt.startsWith('[basic-memory-bridge: standard-interval-checkpoint]\n'));
   assert.equal(f.statuses.at(-1).label, 'queued');
   assert.equal(f.statuses.at(-1).prefix, 'last checkpoint: none, next checkpoint: ');
   assert.deepEqual(f.warnings.map(value => value.message), [
@@ -214,15 +222,526 @@ test('accepted pressure opportunity resets periodic hint time and post-checkpoin
   const f = await fixture();
   f.info({ totalTokens: 130000, limit: 200000 });
   await f.idle();
+  assert.ok(f.sent[0].prompt.startsWith('[basic-memory-bridge: pressure-checkpoint]\n'));
   assert.equal((await f.state()).pressureOpportunityEpoch, 0);
   await f.event('user.message', { messageId: 'message-1' });
   f.info({ totalTokens: 132000, limit: 200000 });
   await f.idle();
   const hint = f.statuses.at(-1);
-  assert.equal(hint.targets.length, 1);
+  assert.equal(hint.targets.length, 2);
   assert.equal(hint.targets[0].tokens, 182000);
   assert.equal(hint.targets[0].notBefore, start + 3600000);
+  assert.equal(hint.targets[1].tokens, 150000);
+  assert.equal(hint.targets[1].notBefore, start + 300000);
   assert.equal((await f.state()).lastOpportunityTokens, 132000);
+});
+
+test('checkpoint prompts identify automation and return continuation responsibility to the agent', () => {
+  for (const type of ['standard-interval-checkpoint', 'pressure-checkpoint', 'emergency-checkpoint']) {
+    const prompt = checkpointPrompt('prompt-test', { cwd: 'C:\\synthetic', branch: 'synthetic' }, type);
+    assert.ok(prompt.startsWith(`[basic-memory-bridge: ${type}]\n`));
+    assert.match(prompt, /"thread_id":"copilot:prompt-test"/);
+    assert.ok(prompt.endsWith('After capturing memory or deciding not to, resume your previous unfinished task, respecting newer instructions and explicit stop/cancel requests.'));
+    assert.ok(!prompt.includes('Finish normally.'));
+  }
+  assert.throws(() => checkpointPrompt('prompt-test', {}, 'unknown'), /checkpoint-type-invalid/);
+});
+
+test('a normally finished 65% checkpoint permits an extra idle-only 75% checkpoint after the existing gap', async () => {
+  const f = await fixture({ recoverAfterCompaction: false });
+  await f.usage(65000);
+  await f.idle();
+  assert.equal((await f.state()).captureInFlight.kind, 'pressure');
+  await f.event('user.message', { messageId: 'message-1' });
+  await f.usage(74000);
+  await f.idle();
+  assert.equal((await f.state()).pressureCompletedEpoch, 0);
+  await f.usage(75000);
+  assert.equal(f.sent.length, 1);
+  f.time(start + 299999);
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  f.time(start + 300000);
+  await f.idle();
+  assert.equal(f.sent.length, 2);
+  assert.equal((await f.state()).captureInFlight.kind, 'pressure-extra');
+  assert.equal((await f.state()).pressureExtraOpportunityEpoch, 0);
+  assert.equal(f.sent[1].mode, 'enqueue');
+  assert.ok(f.sent[1].prompt.startsWith('[basic-memory-bridge: pressure-checkpoint]'));
+  assert.equal(f.aborts.length, 0);
+  await f.event('user.message', { messageId: 'message-2' });
+  await f.idle();
+  f.time(start + 600000);
+  await f.usage(85000);
+  await f.idle();
+  assert.equal(f.sent.length, 2);
+  assert.equal(f.aborts.length, 0);
+});
+
+test('the 70% step steers without idle and its actual delivery suppresses aggressive and extra 75% requests', async () => {
+  const f = await fixture();
+  f.active(true);
+  await f.usage(69999);
+  assert.equal(f.sent.length, 0);
+  await f.usage(70000);
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].mode, 'immediate');
+  assert.equal((await f.state()).captureInFlight.kind, 'pressure-steering');
+  assert.equal((await f.state()).pressureSteeringDeliveredEpoch, null);
+  await f.event('user.message', { messageId: 'message-1' });
+  assert.equal((await f.state()).pressureSteeringDeliveredEpoch, 0);
+  assert.equal(f.statuses.at(-1).label, 'delivered');
+  await f.event('assistant.turn_end');
+  await f.usage(75000);
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.aborts.length, 0);
+  f.active(false);
+  await f.idle();
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).pressureCompletedEpoch, null);
+  assert.ok(f.logs.some(row => row.gateDecision === 'pressure-steering-delivered'));
+});
+
+test('undelivered 70% steering escalates once at 75% with the approved abort and an emergency prompt', async () => {
+  const f = await fixture();
+  f.active(true);
+  await f.usage(70000);
+  await f.usage(74999);
+  assert.equal(f.aborts.length, 0);
+  await f.usage(75000);
+  assert.equal(f.sent.length, 2);
+  assert.equal(f.aborts.length, 1);
+  assert.equal((await f.state()).captureInFlight.kind, 'emergency');
+  assert.ok(f.sent[1].prompt.startsWith('[basic-memory-bridge: emergency-checkpoint]'));
+  assert.equal(f.sent[1].mode, 'enqueue');
+  await f.event('user.message', { messageId: 'message-2' });
+  await f.usage(80000);
+  f.active(false);
+  await f.idle();
+  await f.idle();
+  assert.equal(f.sent.length, 2);
+  assert.equal(f.aborts.length, 1);
+  assert.ok(f.logs.some(row => row.gateDecision === 'emergency-abort-requested'));
+  assert.ok(f.logs.some(row => row.gateDecision === 'emergency-abort-returned'));
+});
+
+test('an initial jump to 75% starts only the emergency step and missing legacy fields migrate prospectively', async () => {
+  const f = await fixture();
+  await f.usage(75000);
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.aborts.length, 1);
+  assert.equal((await f.state()).pressureSteeringAttemptEpoch, null);
+  assert.equal((await f.state()).pressureEmergencyAttemptEpoch, 0);
+  const legacy = await fixture();
+  const state = await legacy.state();
+  for (const key of ['pressureCompletedEpoch', 'pressureExtraOpportunityEpoch', 'pressureSteeringAttemptEpoch',
+    'pressureSteeringDeliveredEpoch', 'pressureEmergencyAttemptEpoch']) delete state[key];
+  state.lastCheckpointTokens = 198000;
+  state.lastCheckpointAt = start - 1000;
+  await writeFile(legacy.store.path, JSON.stringify(state));
+  await legacy.reload();
+  assert.equal((await legacy.state()).pressureCompletedEpoch, null);
+  assert.equal((await legacy.state()).lastCheckpointTokens, 198000);
+});
+
+test('capture-then-continue stays protected until native finish, even when ongoing work crosses 70% and 75%', async () => {
+  const f = await fixture();
+  await f.usage(65000);
+  await f.idle();
+  await f.event('user.message', { messageId: 'message-1' });
+  await f.event('assistant.turn_end');
+  await f.usage(70000);
+  await f.usage(75000);
+  assert.equal((await f.state()).pressureCompletedEpoch, null);
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.aborts.length, 0);
+  f.time(start + 300000);
+  await f.idle();
+  assert.equal((await f.state()).pressureCompletedEpoch, 0);
+  assert.equal(f.sent.length, 2);
+  assert.equal((await f.state()).captureInFlight.kind, 'pressure-extra');
+  assert.equal(f.aborts.length, 0);
+});
+
+test('aborted, errored and unconfirmed pressure requests cannot select the successful 65% branch', async () => {
+  for (const outcome of ['aborted', 'errored', 'unconfirmed']) {
+    const f = await fixture();
+    await f.usage(65000);
+    await f.idle();
+    if (outcome !== 'unconfirmed') await f.event('user.message', { messageId: 'message-1' });
+    if (outcome === 'errored') {
+      await f.event('session.error');
+      await f.reload();
+    }
+    await f.idle(outcome === 'aborted');
+    assert.equal((await f.state()).pressureCompletedEpoch, null, outcome);
+  }
+});
+
+test('compaction and clearing reset escalation stages, but a token decrease does not', async () => {
+  const f = await fixture({ recoverAfterCompaction: false });
+  await f.usage(70000);
+  await f.event('user.message', { messageId: 'message-1' });
+  await f.idle();
+  await f.usage(1000);
+  await f.usage(75000);
+  assert.equal(f.sent.length, 1);
+  await f.event('session.compaction_complete', { success: true });
+  await f.usage(70000);
+  assert.equal(f.sent.length, 2);
+  await f.event('user.message', { messageId: 'message-2' });
+  await f.idle();
+  await f.event('session.context_cleared');
+  await f.usage(75000);
+  assert.equal(f.sent.length, 3);
+  assert.equal(f.aborts.length, 1);
+});
+
+test('failed escalation attempts do not loop and disabling or user cancellation suppresses new interventions', async () => {
+  const f = await fixture();
+  f.session.send = async () => { throw new Error('synthetic send failure'); };
+  await f.usage(70000);
+  await f.usage(71000);
+  assert.equal((await f.state()).pressureSteeringAttemptEpoch, 0);
+  assert.equal(f.aborts.length, 0);
+  f.session.abort = async () => { throw Object.assign(new Error('synthetic abort failure'), { code: 'EIO' }); };
+  await f.usage(75000);
+  await f.usage(80000);
+  assert.equal((await f.state()).pressureEmergencyAttemptEpoch, 0);
+  assert.equal(f.aborts.length, 0);
+  assert.ok(f.logs.some(row => row.operation === 'session.abort' && row.code === 'EIO'));
+  const disabled = await fixture({ enabled: false });
+  await disabled.usage(80000);
+  assert.equal(disabled.sent.length, 0);
+  assert.equal(disabled.aborts.length, 0);
+  const cancelled = await fixture();
+  await cancelled.idle(true);
+  await cancelled.usage(80000);
+  assert.equal(cancelled.sent.length, 0);
+  assert.equal(cancelled.aborts.length, 0);
+});
+
+test('a native delivery received during an earlier await suppresses cancellation before its queued handler runs', async () => {
+  const f = await fixture();
+  await f.usage(70000);
+  const first = f.sent[0];
+  const pending = f.session.rpc.queue.pendingItems;
+  let receipt;
+  f.session.rpc.queue.pendingItems = async () => {
+    f.session.rpc.queue.pendingItems = pending;
+    receipt = f.event('user.message', { source: 'system', content: first.displayPrompt, messageId: 'message-1' });
+    return { items: [], steeringMessages: [] };
+  };
+  await f.usage(75000);
+  await receipt;
+  assert.equal(f.aborts.length, 0);
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).pressureSteeringDeliveredEpoch, 0);
+});
+
+test('delivery before the send response supplies a message ID retains the owned steering correlation', async () => {
+  const f = await fixture();
+  let delivered;
+  f.session.send = async message => {
+    f.sent.push(message);
+    delivered = f.event('user.message', { source: 'system', content: message.displayPrompt, messageId: 'early-id' });
+    return 'early-id';
+  };
+  await f.usage(70000);
+  await delivered;
+  await f.usage(75000);
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.aborts.length, 0);
+  assert.equal((await f.state()).pressureSteeringDeliveredEpoch, 0);
+});
+
+test('escalation uses raw exact boundaries and is independent of capture cooldown and token growth', () => {
+  const state = Object.assign(freshState('boundaries'), {
+    baselineTokens: 74999, lastContextTokens: 69999, tokenLimit: 100000,
+    lastOpportunityAt: start, pressurePending: false,
+  });
+  assert.equal(pressureEscalation(state, defaults), null);
+  state.lastContextTokens = 70000;
+  assert.equal(pressureEscalation(state, defaults), 'pressure-steering');
+  state.pressureSteeringAttemptEpoch = 0;
+  state.lastContextTokens = 74999;
+  assert.equal(pressureEscalation(state, defaults), null);
+  state.lastContextTokens = 75000;
+  assert.equal(pressureEscalation(state, defaults), 'emergency');
+});
+
+test('an emergency uses one queue snapshot and leaves unrelated pending work and the earlier steering request untouched', async () => {
+  for (const queued of ['user-item', 'user-steering']) {
+    const f = await fixture();
+    await f.usage(70000);
+    const steering = f.sent[0];
+    let snapshots = 0;
+    f.session.rpc.queue.pendingItems = async () => {
+      snapshots += 1;
+      return {
+        items: queued === 'user-item' ? [{ id: 'unrelated', messageId: 'human-message', source: 'user' }] : [],
+        steeringMessages: queued === 'user-steering' ? [steering.displayPrompt, 'user instruction'] : [steering.displayPrompt],
+      };
+    };
+    await f.usage(75000);
+    assert.equal(snapshots, 1);
+    assert.equal(f.aborts.length, 0);
+    assert.equal(f.sent.length, 1);
+    assert.equal(f.removed.length, 0);
+    assert.equal((await f.state()).captureInFlight.kind, 'pressure-steering');
+    assert.equal((await f.state()).pressureEmergencyAttemptEpoch, 0);
+    assert.ok(f.logs.some(row => row.gateDecision === 'emergency-skipped-queued-work'));
+    const warning = f.warnings.find(row => row.options.level === 'warning');
+    assert.match(warning.message, /Emergency checkpoint skipped.*Pause pending work.*memory-capture/);
+    await f.usage(80000);
+    assert.equal(snapshots, 1, 'No queue watcher or repeated emergency check.');
+    assert.equal(f.warnings.filter(row => row.options.level === 'warning').length, 1);
+  }
+});
+
+test('a pending owned checkpoint can be replaced without touching unrelated queue items at the steering stage', async () => {
+  const f = await fixture();
+  await f.usage(65000);
+  await f.idle();
+  f.pending([
+    { id: 'own-pending', messageId: 'message-1', source: 'system' },
+    { id: 'user-pending', messageId: 'human-message', source: 'user' },
+  ]);
+  await f.usage(70000);
+  assert.deepEqual(f.removed, ['own-pending']);
+  const pending = await f.session.rpc.queue.pendingItems();
+  assert.deepEqual(pending.items.map(item => item.id), ['user-pending']);
+  assert.equal(f.sent.length, 2);
+  assert.equal(f.sent[1].mode, 'immediate');
+});
+
+test('native interrupted idle is honored without guessing its source, and shutdown suppresses sending', async () => {
+  const f = await fixture();
+  let aborted;
+  f.session.abort = async () => { f.aborts.push(start); aborted = f.idle(true); };
+  await f.usage(75000);
+  await aborted;
+  assert.equal(f.sent.length, 0);
+  assert.equal((await f.state()).pressureEscalationPaused, true);
+  await f.reload();
+  await f.usage(80000);
+  assert.equal(f.sent.length, 0, 'Reload must not undo a cancellation.');
+  assert.ok(f.logs.some(row => row.gateDecision === 'pressure-stopped'));
+  const shutdown = await fixture();
+  let stopped;
+  shutdown.session.abort = async () => { stopped = shutdown.event('session.shutdown'); };
+  await shutdown.usage(75000);
+  await stopped;
+  assert.equal(shutdown.sent.length, 0);
+  assert.equal((await shutdown.state()).captureInFlight, null);
+});
+
+test('a failed emergency queue read restores the existing request instead of leaving an unsent reservation', async () => {
+  const f = await fixture();
+  await f.usage(70000);
+  f.session.rpc.queue.pendingItems = async () => { throw Object.assign(new Error('synthetic queue failure'), { code: 'EACCES' }); };
+  await f.usage(75000);
+  assert.equal((await f.state()).captureInFlight.kind, 'pressure-steering');
+  assert.equal((await f.state()).captureInFlight.messageId, 'message-1');
+  assert.equal(f.aborts.length, 0);
+  assert.equal(f.sent.length, 1);
+  assert.ok(f.logs.some(row => row.operation === 'queue.pending-items' && row.code === 'EACCES'));
+  await f.event('user.message', { messageId: 'message-1' });
+  assert.equal((await f.state()).pressureSteeringDeliveredEpoch, 0);
+});
+
+test('a receipt reconciles a replacement steering send whose response failed without resurrecting the old request', async () => {
+  const f = await fixture();
+  await f.usage(65000);
+  await f.idle();
+  f.pending([{ id: 'old-pending', messageId: 'message-1', source: 'system' }]);
+  let delivered;
+  f.session.send = async message => {
+    f.sent.push(message);
+    delivered = f.event('user.message', {
+      source: 'system', content: message.displayPrompt, messageId: 'received-replacement',
+    });
+    throw Object.assign(new Error('synthetic missing acknowledgement'), { code: -32603 });
+  };
+  await f.usage(70000);
+  await delivered;
+  await f.usage(75000);
+  assert.equal((await f.state()).captureInFlight.kind, 'pressure-steering');
+  assert.equal((await f.state()).captureInFlight.messageId, 'received-replacement');
+  assert.equal((await f.state()).pressureSteeringDeliveredEpoch, 0);
+  assert.equal(f.aborts.length, 0);
+  assert.equal(f.sent.length, 2);
+});
+
+test('review regression: interruption observed during startup prevents escalation before fresh user input', async t => {
+  for (const recoveryPending of [false, true]) {
+    await t.test(recoveryPending ? 'pending recovery' : 'pressure only', async () => {
+      const f = await fixture();
+      if (recoveryPending) await f.store.transaction(state => {
+        state.compactionEpoch = 1;
+        state.pendingRecoveryEpoch = 1;
+      });
+      f.processing(false);
+      let release;
+      f.session.rpc.metadata.snapshot = () => new Promise(resolve => { release = resolve; });
+      f.session.rpc.metadata.contextInfo = async () => ({ contextInfo: { totalTokens: 75000, limit: 100000 } });
+      const bridge = new CaptureBridge({
+        session: f.session, store: f.store, config: async () => defaults,
+        log: async row => f.logs.push(row), clock: () => start,
+      });
+      const starting = bridge.start();
+      const interrupted = bridge.on({ type: 'session.idle', data: { aborted: true } });
+      await new Promise(resolve => setImmediate(resolve));
+      release({ workingDirectory: run, isRemote: false, clientName: 'github/cli' });
+      await Promise.all([starting, interrupted]);
+      assert.equal(f.sent.length, 0);
+      assert.equal(f.aborts.length, 0);
+      assert.equal((await f.state()).pressureEscalationPaused, true);
+      await bridge.on({ type: 'user.message', data: { source: 'user', content: 'Continue the task.', messageId: 'human' } });
+      await bridge.on({ type: 'session.usage_info', data: { currentTokens: 75000, tokenLimit: 100000 } });
+      assert.equal(f.sent.length, 1);
+      assert.equal(f.aborts.length, 1);
+    });
+  }
+});
+
+test('review regression: automated origins cannot clear an interruption pause', async t => {
+  const origins = ['memory', 'skill', 'inter-agent', 'agent-reviewer', 'automation-schedule', 'system', 'autopilot'];
+  for (const source of origins) {
+    await t.test(source, async () => {
+      const f = await fixture();
+      await f.idle(true);
+      await f.event('user.message', { source, content: 'Automatic input.', messageId: source });
+      await f.usage(75000);
+      assert.equal((await f.state()).pressureEscalationPaused, true);
+      assert.equal(f.sent.length, 0);
+      assert.equal(f.aborts.length, 0);
+      await f.event('user.message', { source: 'user', content: 'Continue.', messageId: 'human' });
+      await f.usage(75000);
+      assert.equal(f.sent.length, 1);
+    });
+  }
+  for (const source of [undefined, 'user']) {
+    await t.test(`autopilot continuation with ${source ?? 'default'} source`, async () => {
+      const f = await fixture();
+      await f.idle(true);
+      await f.event('user.message', { source, isAutopilotContinuation: true, content: 'Continue.', messageId: 'autopilot' });
+      await f.usage(75000);
+      assert.equal((await f.state()).pressureEscalationPaused, true);
+      assert.equal(f.sent.length, 0);
+      assert.equal(f.aborts.length, 0);
+    });
+  }
+  await t.test('default-source relay wrapper', async () => {
+    const f = await fixture();
+    await f.idle(true);
+    await f.event('user.message', { content: '[agent-relay] Message from: reviewer\nReview results.', messageId: 'relay' });
+    await f.usage(75000);
+    assert.equal((await f.state()).pressureEscalationPaused, true);
+    assert.equal(f.sent.length, 0);
+    await f.event('user.message', { content: 'Continue.', messageId: 'human-default-source' });
+    await f.usage(75000);
+    assert.equal(f.sent.length, 1);
+  });
+});
+
+test('review regression: uncertain steering receipt remains correlated after reload', async () => {
+  const f = await fixture();
+  f.session.send = async message => {
+    f.sent.push(message);
+    throw Object.assign(new Error('Synthetic missing response.'), { code: -32603 });
+  };
+  await f.usage(70000);
+  const label = f.sent[0].displayPrompt;
+  await f.reload();
+  await f.event('user.message', { source: 'system', content: label, messageId: 'late-receipt' });
+  await f.usage(75000);
+  assert.equal(f.aborts.length, 0);
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).pressureSteeringDeliveredEpoch, 0);
+});
+
+test('review regression: uncertain receipt during reload suppresses startup emergency before its queued handler', async () => {
+  const f = await fixture();
+  f.session.send = async message => {
+    f.sent.push(message);
+    throw new Error('Synthetic response unavailable.');
+  };
+  await f.usage(70000);
+  const label = f.sent[0].displayPrompt;
+  f.info({ totalTokens: 75000, limit: 100000 });
+  const reloading = f.reload();
+  const receipt = f.event('user.message', { source: 'system', content: label, messageId: 'during-reload' });
+  await Promise.all([reloading, receipt]);
+  assert.equal(f.aborts.length, 0);
+  assert.equal(f.sent.length, 1);
+  assert.equal((await f.state()).pressureSteeringDeliveredEpoch, 0);
+});
+
+test('review regression: a late uncertain receipt from before compaction or clear cannot select the new cycle', async t => {
+  for (const type of ['session.compaction_complete', 'session.context_cleared']) {
+    await t.test(type, async () => {
+      const f = await fixture({ recoverAfterCompaction: false });
+      f.session.send = async message => {
+        f.sent.push(message);
+        throw new Error('Synthetic response unavailable.');
+      };
+      await f.usage(70000);
+      const label = f.sent[0].displayPrompt;
+      await f.event(type, { success: true }, { id: 'new-cycle' });
+      await f.event('user.message', { source: 'system', content: label, messageId: 'late-old-receipt' });
+      await f.usage(75000);
+      assert.equal(f.aborts.length, 1);
+      assert.equal(f.sent.length, 2);
+      assert.equal((await f.state()).pressureSteeringDeliveredEpoch, null);
+      assert.equal((await f.state()).uncertainRequest.kind, 'emergency');
+    });
+  }
+});
+
+test('review regression: 65% delivery during unsent 70% preparation preserves the extra idle 75% branch', async () => {
+  const f = await fixture();
+  await f.usage(65000);
+  await f.idle();
+  const label = f.sent[0].displayPrompt;
+  const pending = f.session.rpc.queue.pendingItems;
+  let receipt;
+  f.session.rpc.queue.pendingItems = async () => {
+    f.session.rpc.queue.pendingItems = pending;
+    receipt = f.event('user.message', { source: 'system', content: label, messageId: 'message-1' });
+    return { items: [], steeringMessages: [] };
+  };
+  await f.usage(70000);
+  await receipt;
+  assert.equal(f.sent.length, 1, 'No 70% steering was actually sent.');
+  await f.usage(75000);
+  f.time(start + 300000);
+  await f.idle();
+  assert.equal(f.sent.length, 2);
+  assert.equal((await f.state()).captureInFlight.kind, 'pressure-extra');
+  assert.equal(f.aborts.length, 0);
+});
+
+test('review regression: actual capped logger retains critical pressure records from separate cycles', async () => {
+  const f = await fixture({ recoverAfterCompaction: false });
+  const directory = await mkdtemp(join(run, 'pressure-cycle-logs-'));
+  const bridge = new CaptureBridge({
+    session: f.session, store: f.store, config: async () => validateConfig({ recoverAfterCompaction: false }),
+    log: createLogger(directory, f.session.sessionId, () => start), clock: () => start,
+  });
+  await bridge.start();
+  for (let cycle = 0; cycle < 4; cycle += 1) {
+    if (cycle) await bridge.on({ type: 'session.context_cleared', id: `clear-${cycle}`, data: {} });
+    await bridge.on({ type: 'session.usage_info', data: { currentTokens: cycle < 2 ? 70000 : 75000, tokenLimit: 100000 } });
+    await bridge.on({ type: 'user.message', data: { source: 'system', content: f.sent.at(-1).displayPrompt,
+      messageId: `message-${f.sent.length}` } });
+    await bridge.on({ type: 'session.idle', data: {} });
+  }
+  const rows = (await readFile(join(directory, `${f.session.sessionId}.jsonl`), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(rows.filter(row => row.gateDecision === 'pressure-steering-delivered').map(row => row.compactionEpoch), [0, 1]);
+  assert.deepEqual(rows.filter(row => row.gateDecision === 'emergency-abort-requested').map(row => row.compactionEpoch), [2, 3]);
+  assert.deepEqual(rows.filter(row => row.gateDecision === 'emergency-abort-returned').map(row => row.compactionEpoch), [2, 3]);
 });
 
 test('aborted checkpoint clears the active label and shows no recursion or success claim', async () => {
@@ -590,17 +1109,17 @@ test('native receipt reconciles an accepted request whose state acknowledgement 
   assert.equal((await f.state()).captureInFlight, null);
 });
 
-test('compaction records a missed checkpoint and queues a distinct read-only recovery', async () => {
+test('compaction after an undelivered steering request still queues a distinct read-only recovery', async () => {
   const f = await fixture();
   await f.event('session.usage_info', { currentTokens: 70000, tokenLimit: 100000 });
   await f.event('session.compaction_start');
   await f.event('session.compaction_complete', { success: true });
   f.info({ totalTokens: 10000, limit: 100000 });
   await f.idle();
-  assert.equal(f.sent.length, 1);
-  assert.match(f.sent[0].displayPrompt, /^Basic Memory recovery:/);
-  assert.equal((await f.state()).lastOpportunityAt, null);
-  assert.equal((await f.state()).lastCheckpointAt, null);
+  assert.equal(f.sent.length, 2);
+  assert.equal(f.sent[0].mode, 'immediate');
+  assert.match(f.sent[1].displayPrompt, /^Basic Memory recovery:/);
+  assert.equal((await f.state()).lastOpportunityAt, start);
   assert.equal((await f.state()).compactionEpoch, 1);
   assert.equal((await f.state()).baselineTokens, 10000);
   assert.ok(f.logs.some(row => row.gateDecision === 'missed-pre-compaction'));
@@ -616,7 +1135,7 @@ test('only own queued checkpoint is cancelled when compaction starts', async () 
   assert.equal((await f.state()).captureInFlight, null);
 });
 
-test('high post-compaction context cannot replay a pressure checkpoint without new activity', async () => {
+test('absolute 70% pressure permits one steering request after compaction without a growth gate', async () => {
   const f = await fixture({ recoverAfterCompaction: false });
   await f.event('session.compaction_start');
   await f.event('session.compaction_complete', { success: true });
@@ -624,7 +1143,8 @@ test('high post-compaction context cannot replay a pressure checkpoint without n
   await f.idle();
   f.time(start + 3600000);
   await f.idle();
-  assert.equal(f.sent.length, 0);
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].mode, 'immediate');
   f.info({ totalTokens: 71000, limit: 100000 });
   await f.idle();
   assert.equal(f.sent.length, 1, JSON.stringify({ state: await f.state(), logs: f.logs, notices: f.warnings }));
@@ -698,7 +1218,10 @@ test('successful compaction defers one recovery to safe idle and leaves checkpoi
   assert.equal(finished.lastCheckpointTokens, pending.lastCheckpointTokens);
   assert.equal(finished.pressurePending, false);
   await f.idle();
-  assert.equal(f.sent.length, 1, 'Recovery-generated growth must not start a new checkpoint.');
+  assert.equal(f.sent.length, 2, 'Recovery excludes periodic growth, not the new absolute emergency percentage.');
+  assert.equal((await f.state()).captureInFlight.kind, 'emergency');
+  assert.equal(f.sent[1].mode, 'enqueue');
+  assert.equal(f.aborts.length, 0, 'An already idle session needs no cancellation.');
 });
 
 test('recovery prompt uses the exact same-thread local lookup and prohibits note mutation', () => {
@@ -772,6 +1295,99 @@ test('aborted idle cancels the unsent recovery instead of reviving work after ca
   await f.idle();
   assert.equal(f.sent.length, 0);
   assert.equal((await f.state()).pendingRecoveryEpoch, null);
+});
+
+test('review recovery regression: interruption during the processing read stops startup and completion recovery', async t => {
+  for (const trigger of ['reload', 'compaction']) {
+    await t.test(trigger, async () => {
+      const f = await fixture();
+      if (trigger === 'reload') await f.store.transaction(state => {
+        state.compactionEpoch = 1;
+        state.pendingRecoveryEpoch = 1;
+      });
+      f.processing(false);
+      let release;
+      let entered;
+      const reading = new Promise(resolve => { entered = resolve; });
+      f.session.rpc.metadata.isProcessing = () => new Promise(resolve => {
+        release = resolve;
+        entered();
+      });
+      const recovery = trigger === 'reload' ? f.reload() : f.event('session.compaction_complete', { success: true });
+      await reading;
+      const interrupted = f.idle(true);
+      release({ processing: false });
+      await Promise.all([recovery, interrupted]);
+      assert.equal(f.sent.length, 0);
+      assert.equal(f.aborts.length, 0);
+      assert.equal((await f.state()).captureInFlight, null);
+      assert.equal((await f.state()).pendingRecoveryEpoch, null);
+      assert.equal((await f.state()).pressureEscalationPaused, true);
+    });
+  }
+});
+
+test('review recovery regression: interruption during recovery admission cannot create an automated turn', async t => {
+  for (const [group, method] of [['metadata', 'contextInfo'], ['metadata', 'activity'], ['queue', 'pendingItems']]) {
+    await t.test(`${group}.${method}`, async () => {
+      const f = await fixture();
+      f.processing(false);
+      let release;
+      let entered;
+      const reading = new Promise(resolve => { entered = resolve; });
+      const original = f.session.rpc[group][method];
+      f.session.rpc[group][method] = () => {
+        f.session.rpc[group][method] = original;
+        return new Promise(resolve => {
+          release = async () => resolve(await original());
+          entered();
+        });
+      };
+      const recovery = f.event('session.compaction_complete', { success: true });
+      await reading;
+      const interrupted = f.idle(true);
+      await release();
+      await Promise.all([recovery, interrupted]);
+      assert.equal(f.sent.length, 0);
+      assert.equal(f.aborts.length, 0);
+      assert.equal((await f.state()).captureInFlight, null);
+      assert.equal((await f.state()).pendingRecoveryEpoch, null);
+      assert.equal((await f.state()).pressureEscalationPaused, true);
+    });
+  }
+});
+
+test('review recovery regression: interruption after reservation still prevents the recovery send', async () => {
+  const f = await fixture();
+  await f.store.transaction(state => {
+    state.compactionEpoch = 1;
+    state.pendingRecoveryEpoch = 1;
+  });
+  f.processing(false);
+  let release;
+  let entered;
+  let held = false;
+  const publishing = new Promise(resolve => { entered = resolve; });
+  const bridge = new CaptureBridge({
+    session: f.session, store: f.store, config: async () => defaults,
+    log: async row => f.logs.push(row), clock: () => start,
+    status: async () => {
+      if (!held && bridge.lastState?.captureInFlight?.kind === 'recovery') {
+        held = true;
+        await new Promise(resolve => { release = resolve; entered(); });
+      }
+    },
+  });
+  const recovery = bridge.start();
+  await publishing;
+  const interrupted = bridge.on({ type: 'session.idle', data: { aborted: true } });
+  release();
+  await Promise.all([recovery, interrupted]);
+  assert.equal(f.sent.length, 0);
+  assert.equal(f.aborts.length, 0);
+  assert.equal((await f.state()).captureInFlight, null);
+  assert.equal((await f.state()).pendingRecoveryEpoch, null);
+  assert.equal((await f.state()).pressureEscalationPaused, true);
 });
 
 test('failed recovery send is reported once per compaction without consuming capture clocks', async () => {

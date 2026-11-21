@@ -116,6 +116,37 @@ substitute for testing a long-running interactive session.
 
 ## State, diagnostics, and disable
 
+### Pressure escalation bookkeeping
+
+The existing state gains optional per-cycle completion, delivery and attempt
+markers. The normal-pressure completion marker is set only for a correlated,
+started, normally finished 65% request in that same cycle; abort, root runtime
+error or unconfirmed reconciliation must not select the successful branch.
+The 70% marker uses the request's native receipt rather than turn completion.
+The extension observes correlated receipts before queuing their handlers so a
+delivery during earlier awaits can suppress interruption immediately.
+
+At 70% a missing normal checkpoint permits immediate steering. At 75% a still
+undelivered steering request, or an initial jump to that level, permits one
+emergency attempt. A running checkpoint is protected. If the normal request
+finished instead, one idle-only 75% request retains the ordinary pressure gap.
+Per-cycle markers survive reload; compaction/clear resets are distinct from
+token recount. Missing legacy fields start prospectively without history scans.
+
+Only `session.abort()` is a new runtime API. Its bounded request is separate from
+the agent's work: there is no agent-task timeout or safe-resume controller.
+One pre-abort queue snapshot guards unrelated pending work. A skipped emergency
+is recorded and shown as a warning with a manual capture suggestion, without
+watching the queue or retrying that emergency in the same cycle.
+The snapshot/abort sequence is not atomic and cannot protect a message arriving
+between those steps. Cancellation itself can clear queued messages and does not
+guarantee immediate tool stoppage or exact task continuation.
+
+The bridge correlates requests and logs delivery/attempt decisions; it does not
+call Basic Memory tools, inspect capture contents, evaluate quality or infer
+task outcomes. The prompts delegate capture and continuation to the agent and
+identify standard, pressure and emergency requests in square brackets.
+
 Per-session files live under the Copilot home:
 
 ```text
@@ -158,6 +189,20 @@ Repeated identical decisions/failures are limited to once per minute; distinct
 operations or error codes are not suppressed together. Each session log stops
 growing at 1 MiB. No prompts, transcript contents, tool results, paths, or
 exception text are logged. Set `enabled: false` to stop new automatic opportunities.
+
+The extension process log also receives a fixed set of startup records before
+loading the SDK and each local module, around `joinSession`, and when initial
+bridge setup finishes. Each record includes a timestamp, elapsed milliseconds
+and a fixed stage; the first record includes the Node version and a validated
+SDK version, never its raw environment path. An import or attachment failure
+retains the last stage plus sanitized error fields. If the host kills a stalled
+launch, the last started stage remains available without requiring an exception
+to be returned. These records use stderr, not the SDK's stdout transport, and
+do not depend on session attachment or the per-session file logger.
+`bridge-ready` means initialization completed; `bridge-not-ready` means the
+bridge handled an initialization failure, not successful attachment.
+These records improve diagnosis; a successful retry alone does not establish
+the cause of an earlier startup timeout.
 
 Successful startup records `attached` with `trackingMode: events-only`.
 After the state write succeeds, compaction completion records `epoch-reset`,

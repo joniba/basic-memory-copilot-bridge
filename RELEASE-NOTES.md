@@ -1,5 +1,54 @@
 # Release notes
 
+## Startup diagnostic follow-up
+
+On `feature/pressure-escalation`, record startup stages before SDK/local imports,
+around session attachment and on initial bridge readiness. A stalled launch can
+now leave its last reached stage in the extension process log even when the host
+terminates it without returning an exception. Records are a fixed set of safe
+metadata fields on stderr, independent of successful session attachment; no new
+SDK APIs, timers, retry controller or compatibility fallback are introduced.
+
+Entry-module tests cover successful startup, held imports/attachment, sanitized
+import/attachment rejection and failed bridge initialization. The full suite
+passes **294 tests**. This addresses a diagnostic coverage gap; it does not claim
+that a historical startup timeout is fixed merely because a later launch succeeds.
+
+## Feature candidate: pressure escalation
+
+Branch: `feature/pressure-escalation`. Separate from main; activation is per session.
+
+- Add square-bracket automation headers distinguishing standard interval,
+  pressure and emergency checkpoint prompts.
+- Ask the agent to resume its previous unfinished task after capture or a
+  decision to skip, respecting newer instructions and explicit stop/cancel.
+- After a normally finished 65% checkpoint, permit one additional idle-only
+  checkpoint at 75%, retaining the pressure gap.
+- If that normal checkpoint has not happened and none is running, steer once
+  at 70%. Native delivery, not note quality or completion, suppresses 75%
+  interruption on this path.
+- At 75% without that delivery, or an initial jump to 75%, permit one emergency
+  interruption/poke. Protect running checkpoints and keep unrelated queued
+  work by skipping aggressive cancellation when it is present.
+- Show a visible skip warning suggesting that the user pause pending work and
+  request memory-capture manually. No queue restore controller or watcher.
+- Keep bounded stage/delivery/interruption diagnostics and persisted per-cycle
+  bookkeeping. No growth gate, capture verification, task reasoning, completion
+  acknowledgement, polling or agent-task deadline was added.
+
+Native cancellation can clear pending messages. The single queue snapshot is
+not atomic with cancellation; a message arriving in between can still be lost.
+Interruption is not exact pause/resume and can race compaction/tool completion.
+
+All **256 regression tests passed**. Isolated native tests verified missing-delivery interruption, suppression after
+actual receipt and guarded queue preservation with a visible warning. They used
+virtual pressure and a synthetic model, not working-session interruption,
+production corpus writes or proof of exact resumption.
+
+```powershell
+npx --yes "github:joniba/basic-memory-copilot-bridge#feature/pressure-escalation" --update
+```
+
 ## 2026-11-19: Bridge stabilization
 
 Branch: `fix/event-only-compaction`.
