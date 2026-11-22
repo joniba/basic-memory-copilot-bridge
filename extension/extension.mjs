@@ -46,7 +46,7 @@ try {
   });
   startup('bridge-import-complete');
   startup('status-import-start');
-  const { StatusPublisher } = await import('./status-publisher.mjs');
+  const { StatusPublisher, publicationDiagnostic } = await import('./status-publisher.mjs');
   startup('status-import-complete');
   startup('commands-import-start');
   const { bridgeCommand } = await import('./commands.mjs');
@@ -58,14 +58,25 @@ try {
   });
   startup('session-join-complete');
   const stateRoot = join(home, 'extension-state', 'basic-memory-bridge');
-  const publisher = new StatusPublisher(join(home, 'statusline', 'contributions'), session.sessionId, 'basic-memory-bridge');
+  const log = createLogger(join(stateRoot, 'logs'), session.sessionId);
+  const context = () => bridge?.diagnosticContext() ?? { sessionId: session.sessionId, phase: 'initialization' };
+  const publisher = new StatusPublisher(join(home, 'statusline', 'contributions'), session.sessionId, 'basic-memory-bridge', {
+    trace: log.trace, context,
+    report: error => {
+      const record = publicationDiagnostic(error);
+      console.error(JSON.stringify(record));
+      log({ ...record, gateDecision: record.decision, ...context() });
+    },
+    transition: record => log({ event: 'status-contribution', ...record, ...context() }),
+  });
   bridge = new CaptureBridge({
     session,
     store: new FileStateStore(join(stateRoot, 'sessions'), session.sessionId, {
       legacyDirectory: join(home, 'plugin-data', '_direct'),
+      trace: log.trace, context,
     }),
     config: async () => validateConfig(JSON.parse(await readFile(join(root, 'config.json'), 'utf8'))),
-    log: createLogger(join(stateRoot, 'logs'), session.sessionId),
+    log,
     status: value => publisher.publish(value),
   });
   startup('bridge-initialize-start');
@@ -74,10 +85,12 @@ try {
   session.on(event => bridge.on(event));
   for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => {
     publisher.close().catch(() => console.error('{"event":"shutdown","gateDecision":"status-error"}'))
-      .finally(() => process.exit(0));
+      .finally(() => { log.close(); process.exit(0); });
   });
-  session.on('session.shutdown', () => publisher.close()
-    .catch(() => console.error('{"event":"shutdown","gateDecision":"status-error"}')));
+  session.on('session.shutdown', () => {
+    return publisher.close().catch(() => console.error('{"event":"shutdown","gateDecision":"status-error"}'))
+      .finally(() => log.close());
+  });
 } catch (error) {
   startupFailure(error);
   if (session) {

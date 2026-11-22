@@ -12,6 +12,7 @@
     "extension/bridge.mjs",
     "extension/commands.mjs",
     "extension/status-publisher.mjs",
+    "extension/diagnostics.mjs",
     "extension/config.json",
     "statusline/statusline.mjs",
     "statusline/contributions.mjs",
@@ -27,12 +28,13 @@
     "url": "https://github.com/joniba/basic-memory-copilot-bridge.git"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "test": "node --test"
   },
   "dependencies": {
+    "copilot-extension-utils": "github:joniba/copilot-extension-utils#feat/logging-diagnostics",
     "jsonc-parser": "^3.3.1"
   }
 }

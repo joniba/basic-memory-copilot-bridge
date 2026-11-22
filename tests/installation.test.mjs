@@ -4,12 +4,12 @@ import { dirname, join, parse } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { parse as parseJsonc } from 'jsonc-parser';
-import { options, patchSettings, planInstallation, applyInstallation, statusCommand } from '../scripts/install.mjs';
+import { options, patchSettings, planInstallation, applyInstallation, statusCommand, utilityFiles } from '../scripts/install.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 await mkdir(join(root, '.test-artifacts'), { recursive: true });
 const run = await mkdtemp(join(root, '.test-artifacts', 'installation-'));
-const extensionNames = ['config.json', 'status-publisher.mjs', 'bridge.mjs', 'commands.mjs', 'extension.mjs'];
+const extensionNames = ['config.json', 'status-publisher.mjs', 'diagnostics.mjs', 'bridge.mjs', 'commands.mjs', 'extension.mjs'];
 const compositorNames = ['config.json', 'contributions.mjs', 'statusline.mjs'];
 const readJson = async path => JSON.parse(await readFile(path, 'utf8'));
 const selection = (home, more = {}) => ({ home, extension: true, statusline: true, update: false, ...more });
@@ -27,6 +27,7 @@ async function install(target, more = {}, dependencies = dependency) {
 
 async function managed(target) {
   const files = ['settings.json', ...extensionNames.map(name => join('extensions', 'basic-memory-bridge', name)),
+    ...utilityFiles.map(name => join('extensions', 'basic-memory-bridge', 'lib', name)),
     ...compositorNames.map(name => join('statusline', 'context-tokens', name))];
   return Promise.all(files.map(async name => [name, (await readFile(join(target, name))).toString('base64')]));
 }
@@ -64,12 +65,16 @@ test('CLI defaults to both components and explicit absolute destination, honorin
 test('fresh installation copies complete persistent runtime and wires an independent compositor', async () => {
   const target = await home();
   const result = await install(target);
-  assert.equal(result.filesChanged, 9);
+  assert.equal(result.filesChanged, 17);
   assert.equal(result.backup, undefined);
-  assert.deepEqual((await readdir(extension(target))).sort(), [...extensionNames].sort());
+  assert.deepEqual((await readdir(extension(target))).sort(), [...extensionNames, 'lib'].sort());
   assert.deepEqual((await readdir(compositor(target))).sort(), [...compositorNames].sort());
   for (const name of extensionNames) {
     assert.deepEqual(await readFile(join(extension(target), name)), await readFile(join(root, 'extension', name)));
+  }
+  const utility = fileURLToPath(new URL('../', import.meta.resolve('copilot-extension-utils/diagnostics/trace')));
+  for (const name of utilityFiles) {
+    assert.deepEqual(await readFile(join(extension(target), 'lib', name)), await readFile(join(utility, name)));
   }
   for (const name of ['contributions.mjs', 'statusline.mjs']) {
     assert.deepEqual(await readFile(join(compositor(target), name)), await readFile(join(root, 'statusline', name)));

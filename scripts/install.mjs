@@ -13,8 +13,13 @@ import { validateConfig as validateCompositor, expandCommand } from '../statusli
 const script = fileURLToPath(import.meta.url);
 const packageRoot = dirname(dirname(script));
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
-const extensionFiles = ['status-publisher.mjs', 'bridge.mjs', 'commands.mjs', 'extension.mjs'];
+const extensionFiles = ['status-publisher.mjs', 'diagnostics.mjs', 'bridge.mjs', 'commands.mjs', 'extension.mjs'];
 const compositorFiles = ['contributions.mjs', 'statusline.mjs'];
+export const utilityFiles = [
+  'diagnostics/context-fields.mjs', 'diagnostics/error-fields.mjs',
+  'diagnostics/operation.mjs', 'diagnostics/trace.mjs', 'files/lock.mjs',
+  'logging/delivery.mjs', 'logging/rotating-file.mjs',
+];
 
 export function options(args, env = process.env) {
   const { values } = parseArgs({
@@ -197,6 +202,14 @@ export async function planInstallation(selection, {
       if (!source) throw new Error(`Package is missing extension/${name}.`);
       await add(join(extension, name), source.bytes);
     }
+    const utility = fileURLToPath(new URL('../', import.meta.resolve('copilot-extension-utils/diagnostics/trace')));
+    for (const name of utilityFiles) {
+      const source = await snapshot(join(utility, name));
+      if (!source) throw new Error(`Npm dependency is missing ${name}.`);
+      const target = join(extension, 'lib', name);
+      await checkDirectories(home, dirname(target));
+      await add(target, source.bytes);
+    }
   }
   if (selection.statusline) {
     await checkDirectories(home, compositor);
@@ -318,7 +331,7 @@ async function main() {
     console.log(JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8')).version);
     return;
   }
-  if (Number(process.versions.node.split('.')[0]) < 20) throw new Error('Node.js 20 or newer is required.');
+  if (Number(process.versions.node.split('.')[0]) < 22) throw new Error('Node.js 22 or newer is required.');
   const plan = await planInstallation(selection);
   const result = await applyInstallation(plan);
   console.log(result.filesChanged ? `Installed/updated ${result.filesChanged} managed files under ${plan.home}.` : 'Installed runtime is already current; no managed files or settings changed.');

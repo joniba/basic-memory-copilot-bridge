@@ -24,11 +24,11 @@ export function publicationDiagnostic(error) {
   };
 }
 
-async function fileOperation(operation, action, report) {
+async function fileOperation(operation, action, report, trace, context) {
   let lastCode;
   for (let attempt = 0; ; attempt += 1) {
     try {
-      const result = await action();
+      const result = trace ? await trace(`status.${operation}`, action, context) : await action();
       if (attempt) report({ operation, code: lastCode, recovered: true, attempts: attempt + 1 });
       return result;
     } catch (cause) {
@@ -70,6 +70,7 @@ export class StatusPublisher {
   constructor(directory, sessionId, provider, {
     clock = Date.now, lifetime = 30000, renewInterval = 10000,
     report = error => console.error(JSON.stringify(publicationDiagnostic(error))),
+    trace, context = () => ({}), transition = () => {},
   } = {}) {
     if (!validName(sessionId) || !validName(provider)) throw new Error('status-identity-invalid');
     if (!Number.isSafeInteger(lifetime) || lifetime < 1 || lifetime > 120000
@@ -88,6 +89,10 @@ export class StatusPublisher {
     this.closed = false;
     this.queue = Promise.resolve();
     this.report = report;
+    this.operation = (operation, action) => fileOperation(operation, action, this.report, trace,
+      trace ? context() : undefined);
+    this.transition = transition;
+    this.transitionFailures = 0;
     this.timer = setInterval(() => {
       if (this.current && !this.closed) this.renew();
     }, renewInterval);
@@ -107,6 +112,23 @@ export class StatusPublisher {
       }
       return this.write(this.current);
     });
+  }
+
+  signal(record) {
+    const failed = () => {
+      this.transitionFailures = Math.min(this.transitionFailures + 1, Number.MAX_SAFE_INTEGER);
+      try {
+        console.error('{"event":"status-contribution","gateDecision":"diagnostic-error"}');
+      } catch {
+        this.transitionFailures = Math.min(this.transitionFailures + 1, Number.MAX_SAFE_INTEGER);
+      }
+    };
+    try {
+      const submitted = this.transition(record);
+      if (typeof submitted?.then === 'function') Promise.resolve(submitted).catch(failed);
+    } catch {
+      failed();
+    }
   }
 
   renew() {
@@ -146,13 +168,13 @@ export class StatusPublisher {
 
   async write(contribution) {
     if (this.closed) return;
-    await fileOperation('mkdir', () => mkdir(this.directory, { recursive: true }), this.report);
+    await this.operation('mkdir', () => mkdir(this.directory, { recursive: true }));
     if (!this.claimed && this.expectedOwner === undefined) {
       const previous = await this.readRecord();
       this.expectedOwner = typeof previous?.owner === 'string' ? previous.owner : null;
     }
     const lockPath = `${this.path}.lock`;
-    const lock = await fileOperation('lock-acquire', () => this.acquireLock(), this.report);
+    const lock = await this.operation('lock-acquire', () => this.acquireLock());
     let temporary;
     try {
       const previous = await this.readRecord();
@@ -160,6 +182,7 @@ export class StatusPublisher {
       if (this.claimed ? previous && owner !== this.owner : owner !== this.expectedOwner) {
         this.closed = true;
         clearInterval(this.timer);
+        this.signal({ gateDecision: 'owner-changed' });
         return;
       }
       const now = this.clock();
@@ -177,17 +200,17 @@ export class StatusPublisher {
         throw error;
       }
       temporary = `${this.path}.${randomUUID()}.tmp`;
-      await fileOperation('write-temp', () => writeFile(temporary, content, { flag: 'wx', mode: 0o600 }), this.report);
-      await fileOperation('replace', () => rename(temporary, this.path), this.report);
+      await this.operation('write-temp', () => writeFile(temporary, content, { flag: 'wx', mode: 0o600 }));
+      await this.operation('replace', () => rename(temporary, this.path));
       temporary = null;
       this.claimed = true;
     } finally {
       try {
-        if (temporary) await fileOperation('temp-cleanup', () => unlink(temporary), this.report);
+        if (temporary) await this.operation('temp-cleanup', () => unlink(temporary));
       } finally {
-        await fileOperation('lock-close', () => lock.close(), this.report);
+        await this.operation('lock-close', () => lock.close());
         if (process.platform !== 'win32') {
-          await fileOperation('lock-release', () => unlink(lockPath), this.report);
+          await this.operation('lock-release', () => unlink(lockPath));
         }
       }
     }
@@ -195,9 +218,18 @@ export class StatusPublisher {
 
   async readRecord() {
     try {
-      return JSON.parse(await fileOperation('read-owner', () => readFile(this.path, 'utf8'), this.report));
+      const record = JSON.parse(await this.operation('read-owner', () => readFile(this.path, 'utf8')));
+      if (record?.version !== 1 || record?.sessionId !== this.sessionId || !Number.isSafeInteger(record?.expiresAt)) {
+        this.signal({ gateDecision: 'owner-record-invalid' });
+      } else if (record.expiresAt <= this.clock()) {
+        this.signal({ gateDecision: 'owner-record-expired' });
+      }
+      return record;
     } catch (error) {
-      if (error.code === 'ENOENT' || error instanceof SyntaxError) return null;
+      if (error.code === 'ENOENT' || error instanceof SyntaxError) {
+        this.signal({ gateDecision: error.code === 'ENOENT' ? 'owner-record-unavailable' : 'owner-record-invalid' });
+        return null;
+      }
       throw error;
     }
   }
@@ -208,6 +240,7 @@ export class StatusPublisher {
       await this.publish(null);
     } finally {
       this.closed = true;
+      this.signal({ gateDecision: 'closed' });
     }
   }
 }

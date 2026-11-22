@@ -5,12 +5,13 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
-  applyUsage, bridgeDiagnostic, CaptureBridge, checkpointPrompt, createLogger, defaults,
+  applyUsage, bridgeDiagnostic, CaptureBridge, checkpointPrompt, defaults,
   eligibility, FileStateStore, freshState, validateConfig,
   statusContribution,
   recoveryPrompt,
   pressureEscalation,
 } from '../extension/bridge.mjs';
+import { createLogger, settleLogger } from './helpers/diagnostics.mjs';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const artifacts = join(root, '.test-artifacts');
@@ -176,6 +177,7 @@ test('compaction transition is logged only after its state has been persisted', 
 test('persisted transition logs whitelist state fields and preserve distinct compactions within a minute', async () => {
   const directory = await mkdtemp(join(run, 'transition-logs-'));
   const logger = createLogger(directory, 'test-session', () => start);
+  await logger.ready;
   const record = {
     event: 'session.compaction_complete', gateDecision: 'epoch-reset', compactionEpoch: 1,
     recoveryPending: true, trackingMode: 'events-only', prompt: 'private-synthetic-prompt',
@@ -185,6 +187,7 @@ test('persisted transition logs whitelist state fields and preserve distinct com
   await logger({ ...record, compactionEpoch: 2 });
   await logger({ event: 'startup', gateDecision: 'attached', trackingMode: 'private-mode',
     compactionEpoch: 'private-epoch', recoveryPending: 'private-flag' });
+  await settleLogger(logger);
   const text = await readFile(join(directory, 'test-session.jsonl'), 'utf8');
   const rows = text.trim().split('\n').map(line => JSON.parse(line));
   assert.equal(rows.length, 3);
@@ -726,9 +729,11 @@ test('review regression: 65% delivery during unsent 70% preparation preserves th
 test('review regression: actual capped logger retains critical pressure records from separate cycles', async () => {
   const f = await fixture({ recoverAfterCompaction: false });
   const directory = await mkdtemp(join(run, 'pressure-cycle-logs-'));
+  const logger = createLogger(directory, f.session.sessionId, () => start);
+  await logger.ready;
   const bridge = new CaptureBridge({
     session: f.session, store: f.store, config: async () => validateConfig({ recoverAfterCompaction: false }),
-    log: createLogger(directory, f.session.sessionId, () => start), clock: () => start,
+    log: logger, clock: () => start,
   });
   await bridge.start();
   for (let cycle = 0; cycle < 4; cycle += 1) {
@@ -738,6 +743,8 @@ test('review regression: actual capped logger retains critical pressure records 
       messageId: `message-${f.sent.length}` } });
     await bridge.on({ type: 'session.idle', data: {} });
   }
+  await settleLogger(logger);
+  assert.equal(logger.getHealth().delivery.destinations[0].overflow, 0);
   const rows = (await readFile(join(directory, `${f.session.sessionId}.jsonl`), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
   assert.deepEqual(rows.filter(row => row.gateDecision === 'pressure-steering-delivered').map(row => row.compactionEpoch), [0, 1]);
   assert.deepEqual(rows.filter(row => row.gateDecision === 'emergency-abort-requested').map(row => row.compactionEpoch), [2, 3]);
@@ -1767,10 +1774,12 @@ test('diagnostic codes are allowlisted even when nested errors contain private f
 test('bounded diagnostics contain only allowed operational fields', async () => {
   const directory = await mkdtemp(join(run, 'logs-'));
   const logger = createLogger(directory, 'test-session', () => start);
+  await logger.ready;
   const record = { event: 'session.idle', gateDecision: 'below-gate', contextRatio: 0.2,
     prompt: 'synthetic-secret', cwd: 'private-path', toolResult: 'private-result' };
   await logger(record);
   await logger(record);
+  await settleLogger(logger);
   const text = await readFile(join(directory, 'test-session.jsonl'), 'utf8');
   const rows = text.trim().split('\n');
   assert.equal(rows.length, 1);
@@ -1782,6 +1791,7 @@ test('bounded diagnostics contain only allowed operational fields', async () => 
 test('persisted failures retain safe details and do not throttle different operations or codes together', async () => {
   const directory = await mkdtemp(join(run, 'failure-logs-'));
   const logger = createLogger(directory, 'test-session', () => start);
+  await logger.ready;
   const record = {
     event: 'bridge', gateDecision: 'event-error', phase: 'initialization',
     operation: 'metadata.snapshot', code: -32601, errorType: 'Error',
@@ -1792,6 +1802,7 @@ test('persisted failures retain safe details and do not throttle different opera
   await logger({ ...record, operation: 'state.lock-acquire', code: 'EEXIST' });
   await logger({ ...record, code: 'RPC_TIMEOUT' });
   await logger({ ...record, operation: 'private-operation', code: 'private-code', errorType: 'private-type' });
+  await settleLogger(logger);
   const text = await readFile(join(directory, 'test-session.jsonl'), 'utf8');
   const rows = text.trim().split('\n').map(line => JSON.parse(line));
   assert.equal(rows.length, 4);

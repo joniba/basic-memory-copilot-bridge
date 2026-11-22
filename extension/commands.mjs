@@ -134,10 +134,11 @@ export function bridgeCommand(path, getBridge) {
       const bridge = getBridge();
       if (!bridge) throw new Error('Basic Memory bridge is still attaching. Try /bm-bridge again shortly.');
       if (context.sessionId !== bridge.session.sessionId) throw new Error('Basic Memory command session does not match its registered session.');
+      const run = (operation, action) => typeof bridge.diagnose === 'function' ? bridge.diagnose(operation, action) : action();
       let saved = false;
       const notify = async (message, level = 'info') => {
         try {
-          await bounded(bridge.session.log(`[basic-memory-bridge] ${message}`, { level }));
+          await run('session.log', () => bounded(bridge.session.log(`[basic-memory-bridge] ${message}`, { level })));
         } catch {
           console.error('{"event":"command","gateDecision":"notice-error"}');
           throw new Error(saved ? 'Interval was saved, but command confirmation could not be displayed.'
@@ -152,13 +153,13 @@ export function bridgeCommand(path, getBridge) {
         }
         let config;
         try {
-          config = await readConfiguration(path);
+          config = await run('config.read', () => readConfiguration(path));
         } catch {
           await notify(`The installed bridge configuration could not be read or is invalid. No settings changed.\n\n${help}`, 'warning');
           return;
         }
         try {
-          args = await menu(bridge.session, config);
+          args = await run('command.menu', () => menu(bridge.session, config));
         } catch {
           console.error('{"event":"command","gateDecision":"menu-error"}');
           await notify('The action menu failed. No settings changed. Inline /bm-bridge help and /bm-bridge interval <K> remain available.', 'warning');
@@ -180,7 +181,7 @@ export function bridgeCommand(path, getBridge) {
       if (tokens === null) {
         let config;
         try {
-          config = await readConfiguration(path);
+          config = await run('config.read', () => readConfiguration(path));
         } catch {
           await notify(`The installed bridge configuration could not be read or is invalid. No settings changed.\n\n${help}`, 'warning');
           return;
@@ -196,7 +197,7 @@ export function bridgeCommand(path, getBridge) {
       }
       let result;
       try {
-        result = await writeInterval(path, tokens);
+        result = await run('config.write', () => writeInterval(path, tokens));
       } catch (error) {
         saved = error.committed === true;
         await notify(failureMessage(error), 'warning');

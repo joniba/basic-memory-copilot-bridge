@@ -18,11 +18,12 @@ copilot plugin disable basic-memory-copilot
 copilot plugin uninstall basic-memory-copilot
 
 # Install/update native code only, without changing status-line wiring:
-npx github:joniba/basic-memory-copilot-bridge --update --no-statusline
+npx --yes "github:joniba/basic-memory-copilot-bridge#main" --update --no-statusline
 copilot --experimental
 ```
 
-Installation copies the five runtime files into
+Installation copies the six Bridge runtime/configuration files and seven
+shared utility modules into
 `%USERPROFILE%\.copilot\extensions\basic-memory-bridge` (or `COPILOT_HOME`).
 The npx installer refuses an enabled old plugin. It refreshes managed code only
 with explicit `--update`, preserving capture config and state files and backing
@@ -30,8 +31,8 @@ up replaced code. The original `scripts\install-extension.ps1` remains create-on
 and refuses an existing destination. Do not globally reload unrelated extensions
 to activate this bridge. A new process is the controlled activation path.
 The old plugin's scripts, manifest, config, and tests are no longer shipped.
-See [the installation guide](README.md#install-or-update-with-npx) for pinned
-commits, published feature branches, local Node installation and the default
+See [the installation guide](README.md#install-or-update-with-npx) for published
+branches, locked npm dependencies, local Node installation and the default
 combined extension/companion install.
 
 ## Settings and behavior
@@ -185,10 +186,41 @@ initialization is distinguishable from a running process that successfully
 recorded `startup` / `attached`. Initialization retries at the next root idle.
 If the session log cannot be written, sanitized diagnostics fall back to the
 extension process log, retaining both the original failure and the logging failure.
-Repeated identical decisions/failures are limited to once per minute; distinct
-operations or error codes are not suppressed together. Each session log stops
-growing at 1 MiB. No prompts, transcript contents, tool results, paths, or
+Repeated identical decisions/failures are limited to once per minute after
+confirmed file delivery; failed appends do not suppress later evidence.
+Distinct operations, error codes and compaction cycles are not suppressed
+together. Each session keeps a 1 MiB active JSON-lines file and two numbered
+archives (`.jsonl.1` and `.jsonl.2`); rotation replaces only the oldest archive.
+An uncertain append is never replayed. Its bytes are retained and a separator
+keeps the next record independent; readers should report malformed lines and
+continue with later lines. No prompts, transcript contents, tool results, paths, or
 exception text are logged. Set `enabled: false` to stop new automatic opportunities.
+
+Logging and operation tracing use the shared npm package. Traces observe existing
+waits, adding start/outcome, elapsed time and approved operation/request/session/
+phase/cycle identifiers without additional SDK calls. Results, error identity
+and cancellation are unchanged. Debug-off tracing retains failures, not routine
+start/completion records.
+
+File delivery is separate from queue admission. The Bridge bounds its queue at
+256 waiting records and 1 MiB of waiting bytes, with at most one file write active
+and a 16 KiB record limit. Full queues and unavailable logging modules report
+bounded loss counters outside the failing logger. File failures retain safe
+original-operation evidence separately from the file failure. User warnings
+retain their prefix, severity, decision placement and single-emission rules;
+they do not wait for file delivery. Shutdown does not wait for a stuck log
+destination, so accepted records are not a promise of persistence.
+
+Optional logging-module imports have separate stderr start/complete/error
+breadcrumbs. Missing, corrupt or stalled logging imports do not gate session
+attachment or Bridge readiness. The dependency-free entry bootstrap remains
+available before those imports and does not use protocol stdout.
+While the import is pending, a small Bridge-owned batch retains at most 16
+sanitized semantic records and 16 KiB of UTF-8 data. A healthy load hands each
+record once to shared delivery in admission order, preserving its timestamp
+and identifiers; this is still admission, not persistence. Import rejection,
+shutdown, either bootstrap limit, and refused handoffs have separate loss
+counters. A late load after shutdown cannot activate delivery.
 
 The extension process log also receives a fixed set of startup records before
 loading the SDK and each local module, around `joinSession`, and when initial

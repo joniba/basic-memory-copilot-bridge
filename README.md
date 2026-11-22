@@ -11,7 +11,8 @@ For the cumulative stabilization fixes on this branch, see the
 
 ## Requirements
 
-- Node.js 20 or newer (tested with 24.16.0), Git, and GitHub Copilot CLI.
+- Node.js 22 or newer (tested with 22.23.4 and 24.16.0), Git, and GitHub Copilot CLI.
+  Node 20 is no longer supported.
 - PowerShell 7 only when using the legacy PowerShell installation commands.
 - A working **local** Basic Memory MCP server available to Copilot.
 - The upstream Basic Memory `memory-capture` skill installed and enabled.
@@ -40,11 +41,11 @@ From a published revision, install or update in one command without maintaining
 a source checkout:
 
 ```powershell
-npx github:joniba/basic-memory-copilot-bridge --update
+npx --yes "github:joniba/basic-memory-copilot-bridge#main" --update
 ```
 
-The package has an npm executable entry and a strict asset allowlist. npm may
-ask permission to fetch the GitHub package. `--update` separately authorizes
+The package has an npm executable entry and a strict asset allowlist. `--yes`
+accepts npm's package download prompt. `--update` separately authorizes
 replacement of this project's managed runtime files and status-line wiring;
 without it, identical installs are a no-op and changed existing files are refused.
 Changed originals are backed up under
@@ -58,15 +59,19 @@ preferences, checkpoint state, MCP configuration, skills and unrelated settings.
 Code is replaced atomically without purging unknown files. The executable and
 renderer paths point into the persistent Copilot home, not npm's temporary cache.
 The installer does not launch Copilot, reload extensions, or configure Basic Memory.
-Native runtime code remains dependency-free apart from the SDK supplied by Copilot;
-the installer alone uses a JSONC parser.
+The shared logging/diagnostics package is an ordinary GitHub npm dependency.
+Its branch selector is retained in `package.json`, with the reviewed commit
+pinned by `package-lock.json`. The installer copies its seven self-contained
+modules into the extension's persistent `lib` directory. The installed runtime
+does not import from the checkout, `node_modules`, or npm's cache; the only
+external runtime dependency is the SDK supplied by Copilot.
 
 ```powershell
 # Native extension only; an existing companion is left untouched:
-npx github:joniba/basic-memory-copilot-bridge --update --no-statusline
+npx --yes "github:joniba/basic-memory-copilot-bridge#main" --update --no-statusline
 
 # Independent token/status companion only:
-npx github:joniba/basic-memory-copilot-bridge --update --statusline-only
+npx --yes "github:joniba/basic-memory-copilot-bridge#main" --update --statusline-only
 ```
 
 Use `--copilot-home` with an absolute path to select another destination;
@@ -75,38 +80,33 @@ The installer refuses symlinked managed paths and ambiguous existing compositor
 wiring rather than risking a recursive wrapper or overwriting another location.
 It never logs the saved previous command.
 
-### Share a feature branch or pinned revision
+### Share a published feature branch
 
 npm Git selectors make published in-progress features installable without a clone:
 
 ```powershell
-npx "github:joniba/basic-memory-copilot-bridge#feature/npx-installation" --update
-```
-
-For reproducible testing, prefer an exact published commit over a moving branch:
-
-```powershell
-$repo = 'github:joniba/basic-memory-copilot-bridge'
-$revision = '<full-commit-sha>'
-npx "$repo#$revision" --update
+npx --yes "github:joniba/basic-memory-copilot-bridge#feature/pressure-escalation" --update
 ```
 
 Only published refs can be fetched from GitHub. npm can cache Git package
-resolutions, so pin the requested commit when exchanging a specific candidate.
+resolutions. Use branch names in installation commands, verify the candidate's
+installed files, and retain npm's lockfile to pin shared dependencies.
 This package is distributed from GitHub, not published to the npm registry.
 
 ### From a checkout or extracted ZIP
 
 ```powershell
-npm install --ignore-scripts
-node .\scripts\install.mjs --update
+$repo = 'C:\src\basic-memory-copilot-bridge'
+npm ci --prefix $repo
+node (Join-Path $repo 'scripts\install.mjs') --update
 ```
 
-The original dependency-free PowerShell commands remain **create-only**:
+The original PowerShell entrypoints remain **create-only**. Install npm
+dependencies in the checkout first:
 
 ```powershell
-.\scripts\install-extension.ps1
-.\scripts\install-statusline.ps1
+& (Join-Path $repo 'scripts\install-extension.ps1')
+& (Join-Path $repo 'scripts\install-statusline.ps1')
 ```
 
 Those commands still refuse an existing destination. The native-only PowerShell

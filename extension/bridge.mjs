@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFile, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { createDiagnostics } from './diagnostics.mjs';
 
 export const defaults = Object.freeze({
   enabled: true,
@@ -18,17 +19,21 @@ const optionalCount = value => value === null || count(value);
 const sessionIdValid = value => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(value);
 const failureOperations = new WeakMap();
 const diagnosticOperations = new Set([
-  'config.read', 'diagnostic.write', 'metadata.snapshot', 'metadata.context-info',
+  'config.read', 'config.write', 'command.menu', 'diagnostic.write', 'diagnostic.import', 'metadata.snapshot', 'metadata.context-info',
   'metadata.activity', 'metadata.is-processing',
   'queue.pending-items', 'queue.remove', 'session.send', 'session.abort', 'session.log', 'status.publish',
   'state.transaction', 'state.mkdir', 'state.lock-acquire', 'state.stat', 'state.read',
   'state.legacy-read', 'state.write-temp', 'state.replace', 'state.temp-cleanup',
   'state.lock-close', 'state.lock-release',
+  'status.mkdir', 'status.lock-acquire', 'status.read-owner', 'status.write-temp',
+  'status.replace', 'status.temp-cleanup', 'status.lock-close', 'status.lock-release',
+  'mkdir', 'lock-acquire', 'read-owner', 'write-temp', 'replace', 'temp-cleanup', 'lock-close', 'lock-release', 'encode',
 ]);
 const diagnosticCodes = new Set([
   'EACCES', 'EPERM', 'EBUSY', 'EEXIST', 'ENOENT', 'ENOSPC', 'EIO', 'EMFILE', 'ENFILE',
   'EROFS', 'ENOTDIR', 'EISDIR', 'EINVAL', 'EXDEV', 'ECONNRESET', 'EPIPE', 'ETIMEDOUT',
-  'ERR_IPC_CHANNEL_CLOSED', 'ERR_STREAM_DESTROYED', 'ERR_INVALID_ARG_TYPE',
+  'ERR_IPC_CHANNEL_CLOSED', 'ERR_STREAM_DESTROYED', 'ERR_INVALID_ARG_TYPE', 'ERR_LOG_CHANGED',
+  'EADDRINUSE', 'INVALID', 'LIMIT',
   'RPC_TIMEOUT', 'CONFIG_INVALID', 'STATE_INVALID', 'USAGE_INVALID',
   'PROCESSING_STATE_INVALID', 'MESSAGE_ID_INVALID',
   -32700, -32600, -32601, -32602, -32603, -32000,
@@ -41,15 +46,18 @@ const messageCodes = new Map([
   ['message-id-invalid', 'MESSAGE_ID_INVALID'],
 ]);
 
-async function diagnosed(operation, action) {
-  try {
-    return await action();
-  } catch (error) {
-    if (error !== null && typeof error === 'object' && !failureOperations.has(error)) {
-      failureOperations.set(error, operation);
+async function diagnosed(operation, action, trace, context) {
+  const execute = async () => {
+    try {
+      return await action();
+    } catch (error) {
+      if (error !== null && typeof error === 'object' && !failureOperations.has(error)) {
+        failureOperations.set(error, operation);
+      }
+      throw error;
     }
-    throw error;
-  }
+  };
+  return trace ? await trace(operation, execute, context) : await execute();
 }
 
 function diagnosticFields(value) {
@@ -130,26 +138,28 @@ function validState(state, sessionId) {
 }
 
 export class FileStateStore {
-  constructor(directory, sessionId, { legacyDirectory = null } = {}) {
+  constructor(directory, sessionId, { legacyDirectory = null, trace, context = () => ({}) } = {}) {
     if (!sessionIdValid(sessionId)) throw new Error('session-invalid');
     this.sessionId = sessionId;
     this.directory = directory;
     this.path = join(directory, `${sessionId}.json`);
     this.legacyDirectory = legacyDirectory;
+    this.diagnose = (operation, action) => diagnosed(operation, action, trace,
+      trace ? { ...context(), sessionId } : undefined);
   }
 
   async transaction(action) {
-    await diagnosed('state.mkdir', () => mkdir(this.directory, { recursive: true }));
+    await this.diagnose('state.mkdir', () => mkdir(this.directory, { recursive: true }));
     const lockPath = `${this.path}.lock`;
-    const lock = await diagnosed('state.lock-acquire', () => open(lockPath, 'wx'));
+    const lock = await this.diagnose('state.lock-acquire', () => open(lockPath, 'wx'));
     let temporary;
     try {
       let state;
       let recovered = false;
       try {
-        const info = await diagnosed('state.stat', () => stat(this.path));
+        const info = await this.diagnose('state.stat', () => stat(this.path));
         if (info.size > 16384) throw new Error('state-invalid');
-        state = JSON.parse(await diagnosed('state.read', () => readFile(this.path, 'utf8')));
+        state = JSON.parse(await this.diagnose('state.read', () => readFile(this.path, 'utf8')));
         if (object(state) && !Object.hasOwn(state, 'pendingRecoveryEpoch')) state.pendingRecoveryEpoch = null;
         if (object(state)) {
           for (const key of ['pressureCompletedEpoch', 'pressureExtraOpportunityEpoch', 'pressureSteeringAttemptEpoch',
@@ -183,7 +193,7 @@ export class FileStateStore {
         if (error.code === 'ENOENT') {
           state = freshState(this.sessionId);
           if (this.legacyDirectory) {
-            state.lastOpportunityAt = await diagnosed('state.legacy-read',
+            state.lastOpportunityAt = await this.diagnose('state.legacy-read',
               () => legacyOpportunity(this.legacyDirectory, this.sessionId));
             state.lastCheckpointAt = state.lastOpportunityAt;
           }
@@ -195,17 +205,17 @@ export class FileStateStore {
       }
       const result = await action(state, recovered);
       temporary = `${this.path}.${randomUUID()}.tmp`;
-      await diagnosed('state.write-temp',
+      await this.diagnose('state.write-temp',
         () => writeFile(temporary, `${JSON.stringify(state)}\n`, { flag: 'wx', mode: 0o600 }));
-      await diagnosed('state.replace', () => rename(temporary, this.path));
+      await this.diagnose('state.replace', () => rename(temporary, this.path));
       temporary = null;
       return result;
     } finally {
       try {
-        if (temporary) await diagnosed('state.temp-cleanup', () => unlink(temporary));
+        if (temporary) await this.diagnose('state.temp-cleanup', () => unlink(temporary));
       } finally {
-        await diagnosed('state.lock-close', () => lock.close());
-        await diagnosed('state.lock-release', () => unlink(lockPath));
+        await this.diagnose('state.lock-close', () => lock.close());
+        await this.diagnose('state.lock-release', () => unlink(lockPath));
       }
     }
   }
@@ -427,44 +437,55 @@ export async function bounded(promise, milliseconds = 5000) {
   }
 }
 
-export function createLogger(directory, sessionId, clock = Date.now) {
+export function createLogger(directory, sessionId, clock = Date.now, options = {}) {
   if (!sessionIdValid(sessionId)) throw new Error('session-invalid');
-  const path = join(directory, `${sessionId}.jsonl`);
-  const recent = new Map();
-  return async record => {
-    const now = clock();
-    const diagnostic = record.operation === undefined ? {} : diagnosticFields(record);
-    const key = JSON.stringify([record.event, record.gateDecision, diagnostic,
-      count(record.compactionEpoch) ? record.compactionEpoch : null]);
-    if (recent.has(key) && now - recent.get(key) < 60000) return;
-    recent.set(key, now);
-    if (recent.size > 32) recent.delete(recent.keys().next().value);
-    await mkdir(directory, { recursive: true });
-    try {
-      if ((await stat(path)).size >= 1024 * 1024) return;
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
+  const format = input => {
+    const record = input.fields ? { ...input.fields, event: input.event,
+      gateDecision: `operation-${input.event.slice(input.event.lastIndexOf('.') + 1)}` } : input;
+    const label = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
+    if (!label(record.event) || record.gateDecision !== undefined && !label(record.gateDecision)) {
+      throw new Error('diagnostic-record-invalid');
     }
-    await appendFile(path, `${JSON.stringify({
-      timestamp: new Date(now).toISOString(), sessionId, event: record.event,
+    const diagnostic = record.operation === undefined ? {} : diagnosticFields(record);
+    return {
+      timestamp: new Date(clock()).toISOString(), sessionId, event: record.event,
       gateDecision: record.gateDecision,
       ...(Number.isFinite(record.contextRatio) ? { contextRatio: record.contextRatio } : {}),
       ...(record.phase === 'initialization' || record.phase === 'event' ? { phase: record.phase } : {}),
       ...(record.trackingMode === 'events-only' ? { trackingMode: record.trackingMode } : {}),
       ...(count(record.compactionEpoch) ? { compactionEpoch: record.compactionEpoch } : {}),
       ...(typeof record.recoveryPending === 'boolean' ? { recoveryPending: record.recoveryPending } : {}),
+      ...(record.decision === 'failed' || record.decision === 'recovered' ? { decision: record.decision } : {}),
+      ...(Number.isInteger(record.attempts) && record.attempts >= 1 && record.attempts <= 6 ? { attempts: record.attempts } : {}),
+      ...(sessionIdValid(record.operationId) ? { operationId: record.operationId } : {}),
+      ...(sessionIdValid(record.requestId) ? { requestId: record.requestId } : {}),
+      ...(Number.isFinite(record.durationMs) && record.durationMs >= 0 ? { durationMs: record.durationMs } : {}),
       ...diagnostic,
-    })}\n`, { mode: 0o600 });
+    };
   };
+  return createDiagnostics({
+    ...options, path: join(directory, `${sessionId}.jsonl`), sessionId, clock,
+    codes: [...diagnosticCodes], format,
+    suppressionKey: record => record.operationId ? undefined : JSON.stringify([
+      record.event, record.gateDecision,
+      record.operation === undefined ? {} : diagnosticFields(record),
+      count(record.compactionEpoch) ? record.compactionEpoch : null,
+    ]),
+  });
 }
 
 export class CaptureBridge {
   constructor({ session, store, config, log, status = async () => {}, clock = Date.now }) {
     this.session = session;
     this.store = store;
-    this.readConfig = () => diagnosed('config.read', config);
+    this.logBackend = log;
+    this.readConfig = async () => {
+      const value = await this.diagnose('config.read', config);
+      log.setDebug?.(value.debugLogging);
+      return value;
+    };
     this.log = record => diagnosed('diagnostic.write', () => log(record));
-    this.status = value => diagnosed('status.publish', () => status(value));
+    this.status = value => this.diagnose('status.publish', () => status(value));
     this.lastState = null;
     this.clock = clock;
     this.queue = Promise.resolve();
@@ -479,6 +500,19 @@ export class CaptureBridge {
     this.lastReceipt = null;
     this.pressurePaused = false;
     this.failedRequestId = null;
+  }
+
+  diagnosticContext() {
+    const request = this.lastRequest ?? this.lastState?.captureInFlight;
+    return {
+      sessionId: this.session.sessionId, phase: this.ready ? 'event' : 'initialization',
+      ...(this.lastState && { compactionEpoch: this.lastState.compactionEpoch }),
+      ...(request && { requestId: request.id }),
+    };
+  }
+
+  diagnose(operation, action) {
+    return diagnosed(operation, action, this.logBackend.trace, this.diagnosticContext());
   }
 
   report(event, gateDecision, config = defaults, diagnostic = {}) {
@@ -512,7 +546,7 @@ export class CaptureBridge {
 
   async notice(message, level = 'info') {
     try {
-      await diagnosed('session.log',
+      await this.diagnose('session.log',
         () => bounded(this.session.log(`[basic-memory-bridge] ${message}`, { level })));
     } catch (error) {
       await this.warn('notice', error);
@@ -530,7 +564,7 @@ export class CaptureBridge {
 
   async transaction(action) {
     let snapshot;
-    const result = await diagnosed('state.transaction', () => this.store.transaction(async (state, recovered) => {
+    const result = await this.diagnose('state.transaction', () => this.store.transaction(async (state, recovered) => {
       const result = await action(state, recovered);
       snapshot = structuredClone(state);
       return result;
@@ -559,7 +593,7 @@ export class CaptureBridge {
 
   async initialize() {
     const config = await this.readConfig();
-    const metadata = await diagnosed('metadata.snapshot', () => bounded(this.session.rpc.metadata.snapshot()));
+    const metadata = await this.diagnose('metadata.snapshot', () => bounded(this.session.rpc.metadata.snapshot()));
     this.context.cwd = metadata.workingDirectory;
     await this.refreshUsage();
     await this.transaction(async (state, recovered) => {
@@ -568,7 +602,7 @@ export class CaptureBridge {
       if (recovered) await this.report('startup', 'state-recovered');
       if (state.captureInFlight) {
         const pending = await this.pendingFlight(state.captureInFlight);
-        const activity = await diagnosed('metadata.activity', () => bounded(this.session.rpc.metadata.activity()));
+        const activity = await this.diagnose('metadata.activity', () => bounded(this.session.rpc.metadata.activity()));
         if (!pending && !activity.hasActiveWork && !ownMessage(state.captureInFlight, this.lastReceipt)) {
           if (!state.captureInFlight.started) state.uncertainRequest = { ...state.captureInFlight };
           await this.finish(state, 'in-flight-reconciled');
@@ -615,7 +649,7 @@ export class CaptureBridge {
       || !this.lastState || this.lastState.pendingRecoveryEpoch === null || this.lastState.captureInFlight) return;
     const config = await this.readConfig();
     if (!config.enabled || !config.recoverAfterCompaction) return;
-    const { processing } = await diagnosed('metadata.is-processing', () => bounded(this.session.rpc.metadata.isProcessing()));
+    const { processing } = await this.diagnose('metadata.is-processing', () => bounded(this.session.rpc.metadata.isProcessing()));
     if (typeof processing !== 'boolean') throw new Error('processing-state-invalid');
     if (this.stopped || this.compactionStarting || this.pressurePaused) {
       await this.report('bridge.recovery_check', this.compactionStarting
@@ -631,7 +665,7 @@ export class CaptureBridge {
 
   async refreshUsage() {
     this.usage = null;
-    const result = await diagnosed('metadata.context-info',
+    const result = await this.diagnose('metadata.context-info',
       () => bounded(this.session.rpc.metadata.contextInfo({ promptTokenLimit: 0, outputTokenLimit: 0 })));
     const info = result.contextInfo;
     if (info === null || info === undefined) return;
@@ -645,7 +679,7 @@ export class CaptureBridge {
   }
 
   async pendingFlight(flight) {
-    const pending = await diagnosed('queue.pending-items', () => bounded(this.session.rpc.queue.pendingItems()));
+    const pending = await this.diagnose('queue.pending-items', () => bounded(this.session.rpc.queue.pendingItems()));
     return pending.items.find(item => (flight.messageId && item.messageId === flight.messageId)
       || (item.source === 'system' && item.displayText === requestLabel(flight))) ?? null;
   }
@@ -811,7 +845,7 @@ export class CaptureBridge {
         if (state.captureInFlight && !state.captureInFlight.started) {
           const item = await this.pendingFlight(state.captureInFlight);
           if (item) {
-            const result = await diagnosed('queue.remove', () => bounded(this.session.rpc.queue.removeAt({ id: item.id })));
+            const result = await this.diagnose('queue.remove', () => bounded(this.session.rpc.queue.removeAt({ id: item.id })));
             if (result.removed) await this.finish(state, 'queued-checkpoint-cancelled');
           }
         }
@@ -848,7 +882,7 @@ export class CaptureBridge {
         if (state.captureInFlight) {
           const pending = state.captureInFlight.started ? null : await this.pendingFlight(state.captureInFlight);
           const activity = state.captureInFlight.started ? null
-            : await diagnosed('metadata.activity', () => bounded(this.session.rpc.metadata.activity()));
+            : await this.diagnose('metadata.activity', () => bounded(this.session.rpc.metadata.activity()));
           if (state.captureInFlight.started || (!pending && !activity.hasActiveWork)) {
             await this.finish(state, 'checkpoint-aborted');
           }
@@ -860,7 +894,7 @@ export class CaptureBridge {
         if (state.captureInFlight.started) await this.finish(state, 'checkpoint-turn-finished');
         else {
           const item = await this.pendingFlight(state.captureInFlight);
-          const activity = await diagnosed('metadata.activity', () => bounded(this.session.rpc.metadata.activity()));
+          const activity = await this.diagnose('metadata.activity', () => bounded(this.session.rpc.metadata.activity()));
           if (item || activity.hasActiveWork) await this.report(event.type, 'in-flight', config);
           else await this.finish(state, 'in-flight-reconciled');
         }
@@ -889,12 +923,12 @@ export class CaptureBridge {
         await this.report(event.type, this.compactionStarting ? 'compacting' : decision, config);
         return;
       }
-      const activity = await diagnosed('metadata.activity', () => bounded(this.session.rpc.metadata.activity()));
+      const activity = await this.diagnose('metadata.activity', () => bounded(this.session.rpc.metadata.activity()));
       if (decision === 'recovery' && (this.stopped || this.pressurePaused)) {
         await this.report(event.type, 'recovery-stopped', config);
         return;
       }
-      const pending = await diagnosed('queue.pending-items', () => bounded(this.session.rpc.queue.pendingItems()));
+      const pending = await this.diagnose('queue.pending-items', () => bounded(this.session.rpc.queue.pendingItems()));
       if (decision === 'recovery' && (this.stopped || this.pressurePaused)) {
         await this.report(event.type, 'recovery-stopped', config);
         return;
@@ -944,7 +978,7 @@ export class CaptureBridge {
         return restore('pressure-escalation-suppressed');
       }
       if (previous || offer.kind === 'emergency' && event.type !== 'session.idle') {
-        const pending = await diagnosed('queue.pending-items', () => bounded(this.session.rpc.queue.pendingItems()));
+        const pending = await this.diagnose('queue.pending-items', () => bounded(this.session.rpc.queue.pendingItems()));
         const item = previous ? pending.items.find(value => (previous.messageId && value.messageId === previous.messageId)
           || (value.source === 'system' && value.displayText === requestLabel(previous))) : null;
         if (received()) return restore('pressure-delivered-before-escalation');
@@ -956,7 +990,7 @@ export class CaptureBridge {
           return;
         }
         if (item) {
-          const result = await diagnosed('queue.remove', () => bounded(this.session.rpc.queue.removeAt({ id: item.id })));
+          const result = await this.diagnose('queue.remove', () => bounded(this.session.rpc.queue.removeAt({ id: item.id })));
           if (!result.removed) return restore('pressure-pending-request-changed');
         }
         if (received()) return restore('pressure-delivered-before-escalation');
@@ -980,12 +1014,12 @@ export class CaptureBridge {
         if (received() || this.compactionStarting || this.stopped || this.pressurePaused) {
           return restore('pressure-escalation-suppressed');
         }
-        await diagnosed('session.abort', () => bounded(this.session.abort()));
+        await this.diagnose('session.abort', () => bounded(this.session.abort()));
         await this.report(event.type, 'emergency-abort-returned', config, { compactionEpoch: offer.epoch });
         if (this.compactionStarting || this.stopped || this.pressurePaused) return restore('pressure-stopped');
       }
       sending = true;
-      const messageId = await diagnosed('session.send', () => bounded(this.session.send({
+      const messageId = await this.diagnose('session.send', () => bounded(this.session.send({
         prompt: offer.kind === 'recovery' ? recoveryPrompt(this.session.sessionId)
           : checkpointPrompt(this.session.sessionId, this.context,
             offer.kind === 'periodic' ? 'standard-interval-checkpoint'

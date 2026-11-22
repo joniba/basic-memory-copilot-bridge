@@ -21,6 +21,48 @@ async function holdLock(publisher) {
   };
 }
 
+test('publication reports bounded invalid, expired, unavailable and changed-owner transitions', async t => {
+  const records = [];
+  const publisher = new StatusPublisher(directory, 'transition-evidence', 'provider', {
+    clock: () => 1000, transition: record => records.push(record),
+  });
+  t.after(() => publisher.close());
+  await publisher.publish(activity('Initial'));
+  const original = JSON.parse(await readFile(publisher.path, 'utf8'));
+  await writeFile(publisher.path, JSON.stringify({ ...original, expiresAt: 0 }));
+  await publisher.renew();
+  await writeFile(publisher.path, '{');
+  await publisher.renew();
+  const current = JSON.parse(await readFile(publisher.path, 'utf8'));
+  const competing = JSON.stringify({ ...current, owner: 'newer-owner' });
+  await writeFile(publisher.path, competing);
+  await publisher.renew();
+  assert.equal(await readFile(publisher.path, 'utf8'), competing);
+  assert.equal(publisher.closed, true);
+  assert.ok(records.some(record => record.gateDecision === 'owner-record-unavailable'));
+  assert.ok(records.some(record => record.gateDecision === 'owner-record-expired'));
+  assert.ok(records.some(record => record.gateDecision === 'owner-record-invalid'));
+  assert.ok(records.some(record => record.gateDecision === 'owner-changed'));
+  await publisher.close();
+  assert.ok(records.some(record => record.gateDecision === 'closed'));
+});
+
+test('transition-reporting faults cannot change publication or shutdown outcomes', async t => {
+  const records = [];
+  t.mock.method(console, 'error', value => records.push(value));
+  const publisher = new StatusPublisher(directory, 'transition-fault', 'provider', {
+    transition: () => { throw new Error('private-diagnostic-payload'); },
+  });
+  t.after(() => publisher.close());
+  await publisher.publish(activity('Initial'));
+  assert.equal(JSON.parse(await readFile(publisher.path, 'utf8')).contribution.label, 'Initial');
+  await publisher.close();
+  assert.equal(publisher.closed, true);
+  assert.ok(publisher.transitionFailures >= 2);
+  assert.ok(records.length > 0);
+  assert.ok(!records.join('').includes('private'));
+});
+
 test('publication diagnostics contain only known operation and filesystem error codes', () => {
   assert.deepEqual(publicationDiagnostic({
     operation: 'replace', code: 'EPERM', message: 'private-path-and-payload', stack: 'private-stack',
