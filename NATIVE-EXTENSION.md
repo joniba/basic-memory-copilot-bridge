@@ -115,6 +115,10 @@ Native session errors produce a Bridge warning only while a Bridge checkpoint
 or recovery turn has started. Unrelated session errors, including those received
 while a checkpoint is still queued, leave Bridge status and state unchanged.
 Started requests still record runtime failure and retain their in-flight guard.
+The initial working-directory lookup is best-effort. A failure or five-second
+timeout records a sanitized diagnostic in the extension process log and continues
+without directory provenance. It does not retry the lookup or relax token-usage,
+configuration, state or pending-request checks.
 Reservations are not counted as opportunities until the SDK accepts the send.
 One-shot `-p` mode can terminate during idle follow-up delivery; it is not a
 substitute for testing a long-running interactive session.

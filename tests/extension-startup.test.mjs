@@ -56,14 +56,25 @@ export async function joinSession(options) {
   if (options.commands?.[0]?.name !== 'bm-bridge') throw failure();
   return {
     sessionId: 'entry-startup-fixture',
-    log: async () => {},
+    log: async () => {
+      if (mode === 'snapshot-error' || mode === 'snapshot-held') {
+        console.error(JSON.stringify({ fixtureUnexpectedTimelineLog: true }));
+      }
+    },
     on: () => () => {},
     rpc: { metadata: {
       snapshot: async () => {
-        if (mode === 'initialize-error') throw failure();
+        if (mode === 'snapshot-error' || mode === 'snapshot-held') {
+          console.error(JSON.stringify({ fixtureSnapshotAttempt: true }));
+          if (mode === 'snapshot-error') throw failure();
+          await new Promise(() => {});
+        }
         return { workingDirectory: process.cwd() };
       },
-      contextInfo: async () => ({ contextInfo: { totalTokens: 1000, limit: 200000 } }),
+      contextInfo: async () => {
+        if (mode === 'initialize-error') throw failure();
+        return { contextInfo: { totalTokens: 1000, limit: 200000 } };
+      },
     } },
   };
 }
@@ -156,9 +167,9 @@ async function exercise(mode, expected) {
   child.stdout.on('data', chunk => { stdout += chunk.toString(); });
   try {
     await observed;
-    if (mode === 'success' || mode === 'initialize-error' || mode === 'package-install') {
+    if (['success', 'initialize-error', 'package-install', 'snapshot-error', 'snapshot-held'].includes(mode)) {
       const path = join(home, 'extension-state', 'basic-memory-bridge', 'logs', 'entry-startup-fixture.jsonl');
-      const marker = mode === 'initialize-error' ? '"operation":"metadata.snapshot"' : '"gateDecision":"attached"';
+      const marker = mode === 'initialize-error' ? '"operation":"metadata.context-info"' : '"gateDecision":"attached"';
       const deadline = Date.now() + 5000;
       while (true) {
         let saved = '';
@@ -236,7 +247,22 @@ test('entry module does not claim readiness when native bridge initialization fa
   assert.ok(!f.startup.some(row => row.gateDecision === 'bridge-ready'));
   const log = await readFile(join(f.home, 'extension-state', 'basic-memory-bridge', 'logs',
     'entry-startup-fixture.jsonl'), 'utf8');
-  assert.ok(log.includes('"operation":"metadata.snapshot"'));
+  assert.ok(log.includes('"operation":"metadata.context-info"'));
+});
+
+test('entry reaches readiness after a rejected or timed-out optional snapshot without timeline RPCs', async t => {
+  for (const [mode, code] of [['snapshot-error', -32603], ['snapshot-held', 'RPC_TIMEOUT']]) {
+    await t.test(mode, async () => {
+      const f = await exercise(mode, '"gateDecision":"bridge-ready"');
+      assert.equal(f.startup.at(-1).gateDecision, 'bridge-ready');
+      const failure = f.rows.find(row => row.gateDecision === 'startup-context-unavailable');
+      assert.equal(failure.operation, 'metadata.snapshot');
+      assert.equal(failure.code, code);
+      assert.equal(failure.phase, 'initialization');
+      assert.equal(f.rows.filter(row => row.fixtureSnapshotAttempt).length, 1);
+      assert.ok(!f.rows.some(row => row.fixtureUnexpectedTimelineLog));
+    });
+  }
 });
 
 test('actual entry stays ready with missing, corrupt or held installed utilities and inaccessible checkout/cache', async t => {
