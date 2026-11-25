@@ -730,8 +730,8 @@ export class CaptureBridge {
     }
     const config = await this.readConfig();
     if (event.type === 'session.error') {
-      await this.warn('session');
       if (this.lastState?.captureInFlight?.started) {
+        await this.warn('session');
         await this.transaction(state => { if (state.captureInFlight?.started) state.captureInFlight.errored = true; });
       }
       return;
