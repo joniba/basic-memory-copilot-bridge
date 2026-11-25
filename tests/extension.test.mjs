@@ -1613,51 +1613,101 @@ test('a new compaction racing recovery admission cancels the unsent recovery wit
 
 test('failed initialization does not prompt until it can establish the native baseline', async () => {
   const f = await fixture();
-  f.session.rpc.metadata.snapshot = async () => { throw new Error('snapshot failure'); };
+  const contextInfo = f.session.rpc.metadata.contextInfo;
+  f.session.rpc.metadata.contextInfo = async () => { throw new Error('usage failure'); };
   await f.reload();
   f.info({ totalTokens: 51000, limit: 200000 });
   await f.idle();
   assert.equal(f.sent.length, 0);
-  f.session.rpc.metadata.snapshot = async () => ({ workingDirectory: f.directory, isRemote: false, clientName: 'copilot-cli' });
+  f.session.rpc.metadata.contextInfo = contextInfo;
   await f.idle();
   assert.equal(f.sent.length, 1);
 });
 
-test('snapshot failure records its operation and safe RPC code, then retries initialization without duplicate capture', async () => {
+test('snapshot failures omit cwd without blocking initialization or invoking diagnostic RPCs', async t => {
+  for (const [name, error, code, errorType] of [
+    ['rejection', Object.assign(new Error('private-native-error'), { code: -32601, data: 'private-response' }), -32601, 'Error'],
+    ['timeout', new Error('rpc-timeout'), 'RPC_TIMEOUT', 'Error'],
+    ['type error', new TypeError('private-invalid-snapshot'), 'UNKNOWN', 'TypeError'],
+  ]) {
+    await t.test(name, async t => {
+      const stderr = [];
+      t.mock.method(console, 'error', value => stderr.push(JSON.parse(value)));
+      let snapshotCalls = 0;
+      let timelineCalls = 0;
+      let timeline;
+      const f = await fixture({}, 'test-session', async ({ session }) => {
+        session.rpc.metadata.snapshot = async () => {
+          snapshotCalls += 1;
+          throw error;
+        };
+        timeline = session.log;
+        session.log = async () => {
+          timelineCalls += 1;
+          throw new Error('private-timeline-error');
+        };
+      });
+      assert.ok(f.logs.some(row => row.gateDecision === 'attached'));
+      assert.equal((await f.state()).baselineTokens, 1000);
+      assert.equal(f.statuses.at(-1).kind, 'hint');
+      assert.equal(timelineCalls, 0);
+      assert.equal(stderr.length, 1);
+      assert.equal(stderr[0].gateDecision, 'startup-context-unavailable');
+      assert.equal(stderr[0].phase, 'initialization');
+      assert.equal(stderr[0].operation, 'metadata.snapshot');
+      assert.equal(stderr[0].code, code);
+      assert.equal(stderr[0].errorType, errorType);
+      assert.match(stderr[0].message, /cwd omitted; initialization continuing/);
+      assert.ok(!JSON.stringify([stderr, f.logs, f.warnings]).includes('private'));
+      f.session.log = timeline;
+      f.info({ totalTokens: 51000, limit: 200000 });
+      await f.idle();
+      assert.equal(f.sent.length, 1);
+      assert.ok(!f.sent[0].prompt.includes('"cwd"'));
+      assert.ok(f.sent[0].prompt.includes('"thread_id":"copilot:test-session"'));
+      assert.ok(f.sent[0].prompt.includes('"copilot_session_id":"test-session"'));
+      assert.equal(snapshotCalls, 1, 'No snapshot retries after optional failure.');
+    });
+  }
+});
+
+test('native context changes supply directory provenance after a failed startup snapshot', async t => {
+  t.mock.method(console, 'error', () => {});
+  const f = await fixture({}, 'test-session', async ({ session }) => {
+    session.rpc.metadata.snapshot = async () => { throw new Error('rpc-timeout'); };
+  });
+  const cwd = join(f.directory, 'changed-context');
+  await f.event('session.context_changed', { cwd });
+  f.info({ totalTokens: 51000, limit: 200000 });
+  await f.idle();
+  assert.equal(f.sent.length, 1);
+  assert.ok(f.sent[0].prompt.includes(`"cwd":${JSON.stringify(cwd)}`));
+});
+
+test('usage failure records its operation and safe RPC code, then retries initialization without duplicate capture', async () => {
   const f = await fixture();
-  const snapshot = f.session.rpc.metadata.snapshot;
+  const contextInfo = f.session.rpc.metadata.contextInfo;
   f.logs.length = 0;
-  f.session.rpc.metadata.snapshot = async () => {
+  f.session.rpc.metadata.contextInfo = async () => {
     throw Object.assign(new Error('private-native-error'), { code: -32601, data: 'private-response' });
   };
   await f.reload();
   const failed = f.logs.find(row => row.gateDecision === 'event-error');
   assert.equal(failed.phase, 'initialization');
-  assert.equal(failed.operation, 'metadata.snapshot');
+  assert.equal(failed.operation, 'metadata.context-info');
   assert.equal(failed.code, -32601);
   assert.equal(failed.errorType, 'Error');
-  assert.match(f.warnings.at(-1).message, /metadata.snapshot: -32601/);
+  assert.match(f.warnings.at(-1).message, /metadata.context-info: -32601/);
   assert.ok(!f.logs.some(row => row.gateDecision === 'attached'));
   f.info({ totalTokens: 51000, limit: 200000 });
   await f.idle();
   assert.equal(f.sent.length, 0);
   assert.ok(!JSON.stringify([f.logs, f.warnings]).includes('private'));
-  f.session.rpc.metadata.snapshot = snapshot;
+  f.session.rpc.metadata.contextInfo = contextInfo;
   await f.idle();
   await f.idle();
   assert.equal(f.sent.length, 1);
   assert.ok(f.logs.some(row => row.gateDecision === 'attached'));
-});
-
-test('invalid snapshot response retains the failing operation without exposing exception text', async () => {
-  const f = await fixture();
-  f.session.rpc.metadata.snapshot = async () => { throw new TypeError('private-invalid-snapshot'); };
-  await f.reload();
-  const failed = f.logs.findLast(row => row.gateDecision === 'event-error');
-  assert.equal(failed.operation, 'metadata.snapshot');
-  assert.equal(failed.errorType, 'TypeError');
-  assert.equal(failed.code, 'UNKNOWN');
-  assert.ok(!JSON.stringify(f.logs).includes('Cannot read'));
 });
 
 test('failed compaction clears busy guard without advancing epoch', async () => {
@@ -1851,11 +1901,11 @@ test('a failed diagnostic writer falls back to safe stderr without breaking late
     log: async () => { throw Object.assign(new Error('private-log-path'), { code: 'EACCES' }); },
     clock: () => start,
   });
-  f.session.rpc.metadata.snapshot = async () => {
+  f.session.rpc.metadata.contextInfo = async () => {
     throw Object.assign(new Error('private-rpc-data'), { code: -32601 });
   };
   await bridge.start();
-  assert.equal(stderr.at(-1).operation, 'metadata.snapshot');
+  assert.equal(stderr.at(-1).operation, 'metadata.context-info');
   assert.equal(stderr.at(-1).code, -32601);
   assert.deepEqual(stderr.at(-1).diagnosticFailure, {
     operation: 'diagnostic.write', code: 'EACCES', errorType: 'Error',

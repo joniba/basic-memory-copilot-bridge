@@ -559,8 +559,19 @@ export class CaptureBridge {
 
   async initialize() {
     const config = await this.readConfig();
-    const metadata = await diagnosed('metadata.snapshot', () => bounded(this.session.rpc.metadata.snapshot()));
-    this.context.cwd = metadata.workingDirectory;
+    try {
+      await diagnosed('metadata.snapshot', async () => {
+        const metadata = await bounded(this.session.rpc.metadata.snapshot());
+        this.context.cwd = metadata.workingDirectory;
+      });
+    } catch (error) {
+      this.context.cwd = undefined;
+      console.error(JSON.stringify({
+        event: 'bridge', gateDecision: 'startup-context-unavailable', phase: 'initialization',
+        ...bridgeDiagnostic(error),
+        message: 'Startup context unavailable; cwd omitted; initialization continuing.',
+      }));
+    }
     await this.refreshUsage();
     await this.transaction(async (state, recovered) => {
       state.compacting = false;
