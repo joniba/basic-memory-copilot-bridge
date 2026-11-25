@@ -899,16 +899,50 @@ test('last checkpoint history survives context rebasing, compaction, and reload'
   assert.equal((await f.state()).lastCheckpointTokens, 53000);
 });
 
-test('session error and shutdown clear status without falsely releasing in-flight safety', async () => {
+test('session errors outside a started checkpoint leave Bridge warnings, state and status untouched', async t => {
+  for (const phase of ['no checkpoint', 'queued checkpoint']) {
+    await t.test(phase, async () => {
+      const f = await fixture();
+      if (phase === 'queued checkpoint') {
+        f.info({ totalTokens: 51000, limit: 200000 });
+        await f.idle();
+      }
+      const state = await f.state();
+      const statusCount = f.statuses.length;
+      const sentCount = f.sent.length;
+      f.warnings.length = 0;
+      f.logs.length = 0;
+      await f.event('session.error', { message: 'private error text' });
+      assert.deepEqual(f.warnings, []);
+      assert.deepEqual(f.logs, []);
+      assert.deepEqual(await f.state(), state);
+      assert.equal(f.statuses.length, statusCount);
+      assert.equal(f.sent.length, sentCount);
+    });
+  }
+});
+
+test('running checkpoint errors warn and preserve failed in-flight safety through shutdown', async () => {
   const f = await fixture();
   f.info({ totalTokens: 51000, limit: 200000 });
   await f.idle();
+  await f.event('user.message', { messageId: 'message-1' });
+  f.warnings.length = 0;
   await f.event('session.error', { message: 'private error text' });
-  assert.equal(f.statuses.at(-1), null);
-  assert.notEqual((await f.state()).captureInFlight, null);
+  assert.equal(f.statuses.at(-1).kind, 'activity');
+  const flight = (await f.state()).captureInFlight;
+  assert.equal(flight.started, true);
+  assert.equal(flight.errored, true);
+  assert.deepEqual(f.warnings, [{
+    message: '[basic-memory-bridge] session failed; normal session use continues.',
+    options: { level: 'warning' },
+  }]);
+  assert.ok(f.logs.some(row => row.gateDecision === 'session-error'));
+  assert.ok(!JSON.stringify([f.logs, f.warnings]).includes('private error text'));
+  assert.equal(f.sent.length, 1);
   await f.event('session.shutdown');
   assert.equal(f.statuses.at(-1), null);
-  assert.ok(f.warnings.every(value => value.message.startsWith('[basic-memory-bridge] ')));
+  assert.deepEqual((await f.state()).captureInFlight, flight);
 });
 
 test('production config matches code defaults and native thresholds', async () => {

@@ -111,6 +111,10 @@ The extension therefore emits one attributed timeline notice using `session.log`
 Started/finished/cancelled transitions update the status line without additional
 routine notices. The notice describes the checkpoint turn, not a verified note
 write. All extension timeline warnings also use this prefix; notice failures fail open.
+Native session errors produce a Bridge warning only while a Bridge checkpoint
+or recovery turn has started. Unrelated session errors, including those received
+while a checkpoint is still queued, leave Bridge status and state unchanged.
+Started requests still record runtime failure and retain their in-flight guard.
 Reservations are not counted as opportunities until the SDK accepts the send.
 One-shot `-p` mode can terminate during idle follow-up delivery; it is not a
 substitute for testing a long-running interactive session.
